@@ -67,13 +67,17 @@ EXPOSE 80
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:80/health')" || exit 1
 
-# Start Gunicorn with 2 workers bound to port 80.
+# Start Gunicorn with gthread workers bound to port 80.
+# gthread prevents bare TCP connections (e.g. network probes) from
+# tying up an entire worker process – only one thread is blocked.
 # Override any of these at runtime via the GUNICORN_CMD_ARGS env var.
 CMD ["gunicorn", \
      "--workers=2", \
+     "--threads=4", \
+     "--worker-class=gthread", \
      "--bind=0.0.0.0:80", \
      "--worker-tmp-dir=/dev/shm", \
-     "--timeout=120", \
+     "--timeout=30", \
      "--access-logfile=-", \
      "--error-logfile=-", \
      "main:app"]
