@@ -1,0 +1,11 @@
+services:
+  ucm-name-lookup:
+    build: .
+    container_name: ucm-name-lookup
+    ports:
+      - "5015:80"
+    volumes:
+      - ./phone_directory.csv:/app/phone_directory.csv:ro
+    environment:
+      - LOG_LEVEL=INFO
+    restart: unless-stopped

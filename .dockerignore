@@ -1,0 +1,10 @@
+.venv/
+.idea/
+.windsurf/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+*.md
+Dockerfile
+.dockerignore
