@@ -22,7 +22,7 @@ Usage:
     python main.py
 
     # Production with Gunicorn (HTTP):
-    gunicorn -w 4 -b 0.0.0.0:80 main:app
+    gunicorn -w 2 -b 0.0.0.0:80 --worker-tmp-dir /dev/shm main:app
 
     # Production with Gunicorn (HTTPS):
     gunicorn -w 4 -b 0.0.0.0:443 \\
