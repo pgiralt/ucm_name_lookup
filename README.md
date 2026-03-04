@@ -66,18 +66,24 @@ The server starts on `http://0.0.0.0:5000` by default.
 
 ### Production (Gunicorn)
 
+The service uses `gthread` (threaded) workers so that idle or stalled TCP connections (such as network health probes) only block a single thread instead of an entire worker process. The default configuration of 4 workers × 4 threads provides 16 concurrent connections.
+
 **HTTP:**
 ```bash
-gunicorn -w 4 -b 0.0.0.0:80 main:app
+gunicorn -w 4 --threads 4 --worker-class gthread \
+    -b 0.0.0.0:80 main:app
 ```
 
 **HTTPS:**
 ```bash
-gunicorn -w 4 -b 0.0.0.0:443 \
+gunicorn -w 4 --threads 4 --worker-class gthread \
+    -b 0.0.0.0:443 \
     --certfile=/path/to/server.crt \
     --keyfile=/path/to/server.key \
     main:app
 ```
+
+> **Tuning:** The total thread count (`workers × threads`) should be set to match the **External Call Control Maximum Connection Count to PDP** service parameter in UCM (found under **System > Service Parameters > Cisco CallManager**). This parameter controls how many simultaneous connections UCM opens toward the service and has a maximum value of 20. For example, to support the maximum of 20 connections, use `-w 5 --threads 4` or `-w 4 --threads 5`.
 
 ### Docker
 
@@ -103,7 +109,63 @@ docker run -p 443:443 \
     ucm-name-lookup
 ```
 
-The container runs Gunicorn with 4 workers as a non-root user. Override Gunicorn settings at runtime via the `GUNICORN_CMD_ARGS` environment variable. A built-in Docker `HEALTHCHECK` polls `/health` every 30 seconds.
+The container runs Gunicorn with 4 gthread workers (4 threads each, 16 total) as a non-root user. The worker temporary directory is set to `/dev/shm` (shared memory) to prevent false worker timeouts caused by slow I/O on Docker's overlay filesystem. Override Gunicorn settings at runtime via the `GUNICORN_CMD_ARGS` environment variable. A built-in Docker `HEALTHCHECK` polls `/health` every 30 seconds.
+
+### Docker Compose
+
+A `docker-compose.yml` is included for convenience:
+
+```yaml
+services:
+  ucm-name-lookup:
+    build: .
+    container_name: ucm-name-lookup
+    ports:
+      - "5015:80"
+    volumes:
+      - ./phone_directory.csv:/app/phone_directory.csv:ro
+    environment:
+      - LOG_LEVEL=INFO
+    restart: unless-stopped
+```
+
+**Start the service:**
+```bash
+docker compose up -d
+```
+
+**View logs:**
+```bash
+docker compose logs -f
+```
+
+**Rebuild after code changes:**
+```bash
+docker compose down
+docker compose build --no-cache
+docker compose up -d
+```
+
+By default the compose file maps host port **5015** to the container's port 80. To change the host port, edit the `ports` mapping (e.g., `"80:80"` to listen on port 80).
+
+To enable HTTPS via Docker Compose, mount your TLS certificate and key and override the Gunicorn bind address:
+
+```yaml
+services:
+  ucm-name-lookup:
+    build: .
+    container_name: ucm-name-lookup
+    ports:
+      - "443:443"
+    volumes:
+      - ./phone_directory.csv:/app/phone_directory.csv:ro
+      - ./certs/server.crt:/app/certs/server.crt:ro
+      - ./certs/server.key:/app/certs/server.key:ro
+    environment:
+      - LOG_LEVEL=INFO
+      - GUNICORN_CMD_ARGS=--certfile=/app/certs/server.crt --keyfile=/app/certs/server.key --bind=0.0.0.0:443
+    restart: unless-stopped
+```
 
 ## UCM Configuration
 
@@ -121,6 +183,7 @@ The container runs Gunicorn with 4 workers as a non-root user. Override Gunicorn
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/curri` | CURRI XACML endpoint for UCM ECC requests |
+| `HEAD` | `/curri` | Keepalive probe — returns `200 OK` (used by UCM to check service availability) |
 | `GET` | `/health` | Health check — returns JSON with service status and directory entry count |
 
 ## Testing with curl

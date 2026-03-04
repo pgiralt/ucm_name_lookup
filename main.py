@@ -12,7 +12,7 @@ The service:
     3. Parses the calling party number from the XACML request.
     4. Looks up the display name in the in-memory directory.
     5. Returns an XACML response with a Permit/Continue directive, including
-       the display name if found.  Calls are NEVER rejected.
+       the display name if found. Calls are NEVER rejected.
 
 CURRI Protocol Reference:
     https://developer.cisco.com/site/curri/
@@ -22,10 +22,12 @@ Usage:
     python main.py
 
     # Production with Gunicorn (HTTP):
-    gunicorn -w 2 -b 0.0.0.0:80 --worker-tmp-dir /dev/shm main:app
+    gunicorn -w 4 --threads 4 --worker-class gthread \\
+        -b 0.0.0.0:80 main:app
 
     # Production with Gunicorn (HTTPS):
-    gunicorn -w 4 -b 0.0.0.0:443 \\
+    gunicorn -w 4 --threads 4 --worker-class gthread \\
+        -b 0.0.0.0:443 \\
         --certfile=server.crt --keyfile=server.key main:app
 
 Environment Variables:
@@ -418,7 +420,7 @@ def lookup_display_name(calling_number: str) -> str | None:
 # Flask Routes
 # ===========================================================================
 
-@app.route("/curri", methods=["POST"])
+@app.route("/curri", methods=["POST", "HEAD"])
 def curri_endpoint():
     """CURRI API endpoint for UCM External Call Control (ECC) requests.
 
@@ -442,6 +444,10 @@ def curri_endpoint():
         ``text/xml; charset="utf-8"``.
     """
     logger.debug("Received CURRI request from %s", request.remote_addr)
+
+    # --- Respond to HEAD keepalive probes from UCM ---
+    if request.method == "HEAD":
+        return Response(status=200, content_type='text/xml; charset="utf-8"')
 
     # --- Read the raw XML body from UCM ---
     xml_data = request.data
