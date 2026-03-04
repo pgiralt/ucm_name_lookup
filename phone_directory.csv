@@ -1,6 +1,11 @@
-phone_number,display_name
-+12125551001,Alice Johnson
-+12125551002,Bob Smith
-+12125551003,Carol Williams
-+12125551004,David Brown
-+12125551005,Eve Davis
+phone_number,display_name,match_type
++12125551001,Alice Johnson,exact
++12125551002,Bob Smith,exact
++12125551003,Carol Williams,exact
++12125551004,David Brown,exact
++12125551005,Eve Davis,exact
++1212,New York City,prefix
++1312,Chicago,prefix
++1415,San Francisco,prefix
++1919,North Carolina,prefix
++1919476,"RTP, NC",prefix

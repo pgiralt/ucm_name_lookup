@@ -43,14 +43,29 @@ All configuration is done via environment variables:
 
 ## CSV File Format
 
-The phone directory CSV must have a header row with these columns:
+The phone directory CSV must have a header row with at least these columns:
+
+| Column | Required | Description |
+|---|---|---|
+| `phone_number` | Yes | The phone number or prefix (e.g. `+12125551212` or `+1212`) |
+| `display_name` | Yes | The name to display (e.g. `Alice Johnson`) |
+| `match_type` | No | `exact` (default) or `prefix` |
 
 ```csv
-phone_number,display_name
-+12125551001,Alice Johnson
-+12125551002,Bob Smith
-+12125551003,Carol Williams
+phone_number,display_name,match_type
++12125551001,Alice Johnson,exact
++12125551002,Bob Smith,exact
++1212,New York City,prefix
++1312,Chicago,prefix
++1415,San Francisco,prefix
 ```
+
+**Matching behaviour:**
+- **`exact`** (default when column is absent) — the incoming calling number must match the full normalized phone number.
+- **`prefix`** — any incoming number whose digits *start with* the normalized prefix will match.
+- Exact matches are always evaluated first. Prefix matching is only attempted when no exact match is found, and the **longest** matching prefix wins.
+
+The `match_type` column is optional. If it is omitted entirely, every row is treated as an exact match, preserving backward compatibility with existing CSV files.
 
 **Important**: Phone numbers are normalized to digits only (stripping `+`, `-`, `()`, `.`, spaces) for matching. Ensure your CSV numbers include the country code if UCM sends numbers in E.164 format (e.g., `+12125551212`).
 

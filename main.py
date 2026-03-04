@@ -96,20 +96,86 @@ logger = logging.getLogger("ucm_name_lookup")
 app = Flask(__name__)
 
 # In-memory phone directory loaded from CSV at startup.
-# Keys are normalized phone numbers (digits only), values are display names.
-phone_directory: dict[str, str] = {}
+# exact_directory: keys are normalized phone numbers (digits only), values are display names.
+# prefix_trie: a trie of normalized prefix patterns for longest-prefix matching.
+exact_directory: dict[str, str] = {}
+prefix_trie: "PrefixTrie | None" = None
+
+
+# ===========================================================================
+# Prefix Trie for Efficient Longest-Prefix Matching
+# ===========================================================================
+
+class PrefixTrie:
+    """A trie (prefix tree) for efficient longest-prefix phone number matching.
+
+    Each node in the trie represents a single digit.  Nodes that correspond
+    to the end of a registered prefix store a display name.  Lookup walks
+    the trie character-by-character and remembers the last (i.e. longest)
+    prefix that had a name, giving O(m) performance where *m* is the length
+    of the phone number being looked up.
+    """
+
+    __slots__ = ("_root", "_size")
+
+    def __init__(self) -> None:
+        # Each node is a dict: digit -> child-node-dict.
+        # A special key None stores the display name at that prefix.
+        self._root: dict = {}
+        self._size: int = 0
+
+    def insert(self, prefix: str, display_name: str) -> None:
+        """Insert a prefix -> display_name mapping into the trie."""
+        node = self._root
+        for ch in prefix:
+            node = node.setdefault(ch, {})
+        node[None] = display_name
+        self._size += 1
+
+    def longest_prefix_match(self, number: str) -> str | None:
+        """Return the display name for the longest prefix matching *number*.
+
+        Walks the trie digit-by-digit and tracks the most recent node that
+        stores a display name.  Returns ``None`` if no prefix matches.
+        """
+        node = self._root
+        result: str | None = None
+        for ch in number:
+            child = node.get(ch)
+            if child is None:
+                break
+            node = child
+            name = node.get(None)
+            if name is not None:
+                result = name
+        return result
+
+    def __len__(self) -> int:
+        return self._size
 
 
 # ===========================================================================
 # CSV Directory Loader
 # ===========================================================================
 
-def load_phone_directory(csv_path: str) -> dict[str, str]:
+def load_phone_directory(
+    csv_path: str,
+) -> tuple[dict[str, str], PrefixTrie]:
     """Load a phone number -> display name mapping from a CSV file.
 
     The CSV file must have a header row with at least two columns:
         - ``phone_number``  : The phone number (e.g. "+12125551212")
         - ``display_name``  : The name to display (e.g. "John Doe")
+
+    An optional third column controls the matching behaviour:
+        - ``match_type``    : ``exact`` (default) or ``prefix``
+
+    When ``match_type`` is ``exact`` (or the column is absent), the
+    incoming calling number must match the normalized phone number
+    exactly.  When ``match_type`` is ``prefix``, the phone number is
+    treated as a digit prefix — any incoming number that *starts with*
+    those digits will match.  Exact matches are always evaluated before
+    prefix matches, and the *longest* matching prefix wins.
 
     Phone numbers are normalized by stripping whitespace, leading '+' signs,
     dashes, parentheses, and dots so that lookup matching is resilient to
@@ -124,18 +190,24 @@ def load_phone_directory(csv_path: str) -> dict[str, str]:
         csv_path: Filesystem path to the CSV file.
 
     Returns:
-        A dictionary mapping normalized phone numbers to display names.
+        A tuple of ``(exact_directory, prefix_trie)`` where
+        *exact_directory* is a dict mapping normalized phone numbers to
+        display names and *prefix_trie* is a :class:`PrefixTrie` for
+        longest-prefix lookups.
 
     Raises:
         FileNotFoundError: If the CSV file does not exist.
         SystemExit: If the CSV file is malformed or missing required columns.
     """
     directory: dict[str, str] = {}
+    trie = PrefixTrie()
     logger.info("Loading phone directory from: %s", csv_path)
 
     if not os.path.isfile(csv_path):
         logger.error("Phone directory CSV file not found: %s", csv_path)
         raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+    valid_match_types = {"exact", "prefix"}
 
     try:
         with open(csv_path, mode="r", encoding="utf-8-sig") as csvfile:
@@ -157,8 +229,11 @@ def load_phone_directory(csv_path: str) -> dict[str, str]:
                 )
                 sys.exit(1)
 
+            has_match_type_column = "match_type" in actual_columns
+
             # --- Load rows into the directory ---
-            row_count = 0
+            exact_count = 0
+            prefix_count = 0
             for row in reader:
                 # Normalize column names so minor header formatting is tolerated.
                 normalized_row = {
@@ -168,26 +243,47 @@ def load_phone_directory(csv_path: str) -> dict[str, str]:
                     normalized_row.get("phone_number", "")
                 )
                 name = normalized_row.get("display_name", "")
+                match_type = (
+                    normalized_row.get("match_type", "exact").lower()
+                    if has_match_type_column
+                    else "exact"
+                )
 
-                if phone and name:
-                    directory[phone] = name
-                    row_count += 1
-                else:
+                if not phone or not name:
                     logger.warning(
                         "Skipping invalid CSV row (empty phone or name): %s", row
                     )
+                    continue
+
+                if match_type not in valid_match_types:
+                    logger.warning(
+                        "Skipping CSV row with invalid match_type '%s' "
+                        "(expected 'exact' or 'prefix'): %s",
+                        match_type,
+                        row,
+                    )
+                    continue
+
+                if match_type == "prefix":
+                    trie.insert(phone, name)
+                    prefix_count += 1
+                else:
+                    directory[phone] = name
+                    exact_count += 1
 
         logger.info(
-            "Phone directory loaded successfully: %d entries from %s",
-            row_count,
+            "Phone directory loaded successfully from %s: "
+            "%d exact entries, %d prefix entries",
             csv_path,
+            exact_count,
+            prefix_count,
         )
 
     except csv.Error as e:
         logger.error("Error reading CSV file %s: %s", csv_path, e)
         sys.exit(1)
 
-    return directory
+    return directory, trie
 
 
 def normalize_phone_number(phone: str) -> str:
@@ -393,6 +489,13 @@ def lookup_display_name(calling_number: str) -> str | None:
     The number is normalized before lookup so that formatting differences
     between UCM and the CSV do not prevent a match.
 
+    Lookup order:
+        1. **Exact match** — O(1) dictionary lookup against numbers loaded
+           with ``match_type=exact`` (or no ``match_type`` column).
+        2. **Longest prefix match** — O(m) trie walk (where *m* is the
+           digit length of the number) against numbers loaded with
+           ``match_type=prefix``.  The longest matching prefix wins.
+
     Args:
         calling_number: The raw calling party number from the CURRI request.
 
@@ -400,20 +503,30 @@ def lookup_display_name(calling_number: str) -> str | None:
         The display name if found, or ``None`` if no match exists.
     """
     normalized = normalize_phone_number(calling_number)
-    display_name = phone_directory.get(normalized)
 
+    # --- 1. Try exact match first (O(1) dict lookup) ---
+    display_name = exact_directory.get(normalized)
     if display_name:
         logger.info(
-            "Name match found: %s -> %s", calling_number, display_name
+            "Exact match found: %s -> %s", calling_number, display_name
         )
-    else:
-        logger.info(
-            "No name match for number: %s (normalized: %s)",
-            calling_number,
-            normalized,
-        )
+        return display_name
 
-    return display_name
+    # --- 2. Fall back to longest prefix match (O(m) trie lookup) ---
+    if prefix_trie is not None:
+        display_name = prefix_trie.longest_prefix_match(normalized)
+        if display_name:
+            logger.info(
+                "Prefix match found: %s -> %s", calling_number, display_name
+            )
+            return display_name
+
+    logger.info(
+        "No name match for number: %s (normalized: %s)",
+        calling_number,
+        normalized,
+    )
+    return None
 
 
 # ===========================================================================
@@ -511,7 +624,8 @@ def health_check():
     """
     return {
         "status": "healthy",
-        "directory_entries": len(phone_directory),
+        "exact_entries": len(exact_directory),
+        "prefix_entries": len(prefix_trie) if prefix_trie else 0,
     }
 
 
@@ -526,9 +640,9 @@ def initialize_app():
     development server) has the directory available for lookups before
     serving its first request.
     """
-    global phone_directory
+    global exact_directory, prefix_trie
     try:
-        phone_directory = load_phone_directory(CSV_FILE_PATH)
+        exact_directory, prefix_trie = load_phone_directory(CSV_FILE_PATH)
     except FileNotFoundError:
         logger.error(
             "Cannot start without a phone directory.  "
