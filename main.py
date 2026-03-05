@@ -30,35 +30,19 @@ Usage:
         -b 0.0.0.0:443 \\
         --certfile=server.crt --keyfile=server.key main:app
 
+Configuration:
+    Non-sensitive settings are defined in a YAML configuration file
+    (default: config.yaml). The file supports multiple UCM cluster
+    definitions, each with its own IP allow-list, CA certificate, and
+    certificate subject validation rules.
+
+    See config.yaml for the full schema and examples.
+
 Environment Variables:
-    CSV_FILE_PATH   - Path to the phone directory CSV file
-                      (default: phone_directory.csv)
-    FLASK_HOST      - Host to bind to in dev mode (default: 0.0.0.0)
-    FLASK_PORT      - Port to bind to in dev mode (default: 5000)
-    TLS_CERT_FILE   - Path to TLS certificate file (optional, dev HTTPS)
-    TLS_KEY_FILE    - Path to TLS private key file (optional, dev HTTPS)
-    TLS_CA_FILE     - Path to CA / client certificate for mutual TLS
-                      (optional).  When set, the server requires
-                      connecting clients (UCM) to present a certificate
-                      signed by this CA.  For production with Gunicorn,
-                      use --ca-certs and --cert-reqs=2 instead.
-    ALLOWED_IPS     - Comma-separated list of IP addresses allowed to
-                      reach the /curri endpoint (optional).  When set,
-                      requests from other IPs receive HTTP 403.  Supports
-                      individual addresses and CIDR notation, e.g.
-                      "10.1.1.10,10.1.1.11,10.1.2.0/24".
-    TLS_ALLOWED_SUBJECTS
-                    - Comma-separated list of expected Common Name (CN)
-                      and/or Subject Alternative Name (SAN) values for
-                      client certificates (optional).  When set, the
-                      application validates that the connecting client's
-                      certificate contains at least one CN or SAN that
-                      matches an entry in this list.  This prevents
-                      any host with a certificate signed by the same CA
-                      from accessing the service.  Example:
-                      "cucm-pub.example.com,cucm-sub1.example.com"
-    LOG_LEVEL       - Logging level: DEBUG, INFO, WARNING, ERROR
-                      (default: INFO)
+    CONFIG_FILE     - Path to the YAML configuration file
+                      (default: config.yaml)
+    LOG_LEVEL       - Logging level override: DEBUG, INFO, WARNING, ERROR
+                      (overrides the value in config.yaml when set)
 """
 
 import csv
@@ -67,8 +51,10 @@ import logging
 import os
 import ssl
 import sys
+from dataclasses import dataclass, field
 from xml.sax.saxutils import escape as xml_escape
 
+import yaml
 from defusedxml import ElementTree as ET
 from flask import Flask, Response, request
 
@@ -76,42 +62,60 @@ from flask import Flask, Response, request
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Path to the YAML configuration file.
+CONFIG_FILE = os.environ.get("CONFIG_FILE", "config.yaml")
+
+
+def _load_config(config_path: str) -> dict:
+    """Load configuration from a YAML file.
+
+    Uses ``yaml.safe_load`` to prevent unsafe deserialization. Returns
+    an empty dict when the file does not exist so that the application
+    can start with sensible defaults.
+    """
+    if not os.path.isfile(config_path):
+        # Cannot use logger yet — logging is configured after this.
+        print(
+            f"[WARNING] Config file not found: {config_path} — "
+            "using built-in defaults"
+        )
+        return {}
+
+    with open(config_path, "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+
+    if data is None:
+        return {}
+
+    if not isinstance(data, dict):
+        print(
+            f"[ERROR] Config file {config_path} must contain a YAML "
+            "mapping at the top level"
+        )
+        sys.exit(1)
+
+    return data
+
+
+_config = _load_config(CONFIG_FILE)
+
 # Path to the CSV file containing phone number -> display name mappings.
-CSV_FILE_PATH = os.environ.get("CSV_FILE_PATH", "phone_directory.csv")
+CSV_FILE_PATH = _config.get("csv_file_path", "phone_directory.csv")
 
 # Flask development server bind address and port.
-FLASK_HOST = os.environ.get("FLASK_HOST", "0.0.0.0")
-FLASK_PORT = int(os.environ.get("FLASK_PORT", "5000"))
+FLASK_HOST = _config.get("flask_host", "0.0.0.0")
+FLASK_PORT = int(_config.get("flask_port", 5000))
 
 # Optional TLS certificate and key for HTTPS in development mode.
 # For production, configure TLS through Gunicorn's --certfile / --keyfile.
-TLS_CERT_FILE = os.environ.get("TLS_CERT_FILE")
-TLS_KEY_FILE = os.environ.get("TLS_KEY_FILE")
+TLS_CERT_FILE = _config.get("tls_cert_file")
+TLS_KEY_FILE = _config.get("tls_key_file")
 
-# Optional CA certificate for mutual TLS (mTLS) client verification.
-# When set, the server requires connecting clients to present a valid
-# certificate signed by this CA.  For UCM, this should be the exported
-# CallManager.pem certificate.
-# For production with Gunicorn, use --ca-certs and --cert-reqs=2 instead.
-TLS_CA_FILE = os.environ.get("TLS_CA_FILE")
-
-# Optional comma-separated list of IP addresses (or CIDR networks)
-# allowed to reach the /curri endpoint.  When set, requests from
-# unlisted IPs receive HTTP 403.  Useful as defense-in-depth to
-# restrict access to known UCM cluster nodes.
-ALLOWED_IPS_RAW = os.environ.get("ALLOWED_IPS", "").strip()
-
-# Optional comma-separated list of expected CN / SAN values that the
-# client certificate must contain.  When set, after the TLS handshake
-# verifies the certificate chain, the application additionally checks
-# that the peer certificate's Common Name or Subject Alternative Name
-# matches at least one entry in this list.  This is critical when the
-# CA is a well-known public CA — without this check, *any* certificate
-# signed by the same CA would be accepted.
-TLS_ALLOWED_SUBJECTS_RAW = os.environ.get("TLS_ALLOWED_SUBJECTS", "").strip()
-
-# Logging verbosity level.
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+# Logging verbosity level. The LOG_LEVEL environment variable, when
+# set, takes precedence over the value in the config file.
+LOG_LEVEL = os.environ.get(
+    "LOG_LEVEL", _config.get("log_level", "INFO")
+).upper()
 
 # XACML 2.0 namespace used by UCM in CURRI requests.
 XACML_NS = "urn:oasis:names:tc:xacml:2.0:context:schema:os"
@@ -134,82 +138,246 @@ logging.basicConfig(
 logger = logging.getLogger("ucm_name_lookup")
 
 # ---------------------------------------------------------------------------
-# IP Allow-List
+# UCM Cluster Definitions
 # ---------------------------------------------------------------------------
 
-def _parse_allowed_networks(
-    raw: str,
-) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
-    """Parse the ALLOWED_IPS environment variable into a list of networks.
+@dataclass
+class ClusterConfig:
+    """Access rules for a single UCM cluster.
 
-    Accepts individual IP addresses (``10.1.1.10``) and CIDR notation
-    (``10.1.2.0/24``).  Individual addresses are converted to /32 (IPv4)
-    or /128 (IPv6) host networks.
+    A request is authorized by a cluster when **all** of the cluster's
+    defined rules match:
 
-    Returns an empty list when the input is blank, meaning IP filtering
-    is disabled.
+        * If ``allowed_networks`` is non-empty, the client IP must fall
+          within at least one listed network.
+        * If ``allowed_subjects`` is non-empty, the client certificate
+          must contain at least one matching CN or SAN.
+
+    Rules that are left empty are not enforced for that cluster.
     """
-    if not raw:
-        return []
+
+    name: str
+    allowed_networks: list[
+        ipaddress.IPv4Network | ipaddress.IPv6Network
+    ] = field(default_factory=list)
+    allowed_subjects: set[str] = field(default_factory=set)
+    ca_file: str | None = None
+    ca_subject: tuple | None = None
+
+
+def _load_ca_subject(ca_file: str, cluster_name: str) -> tuple | None:
+    """Load a CA certificate and return its ``subject`` tuple.
+
+    The returned tuple uses the same nested-tuple format as
+    :meth:`ssl.SSLSocket.getpeercert` so that it can be directly
+    compared with a client certificate's ``issuer`` field at request
+    time. This provides application-layer CA verification: after the
+    TLS handshake accepts any CA in the combined trust store, the
+    application can confirm that the client certificate was actually
+    signed by the *specific* CA assigned to the matched cluster.
+
+    Returns ``None`` if the CA certificate cannot be loaded.
+    """
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_verify_locations(ca_file)
+        ca_certs = ctx.get_ca_certs()
+        if ca_certs:
+            return ca_certs[0].get("subject")
+        logger.warning(
+            "Cluster '%s': CA file '%s' contained no certificates",
+            cluster_name,
+            ca_file,
+        )
+    except (ssl.SSLError, OSError) as exc:
+        logger.error(
+            "Cluster '%s': failed to load CA file '%s': %s",
+            cluster_name,
+            ca_file,
+            exc,
+        )
+    return None
+
+
+def _parse_network_list(
+    entries: list,
+    cluster_name: str,
+) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """Parse a list of IP / CIDR strings into network objects.
+
+    Invalid entries are logged and skipped.
+    """
     networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
-    for entry in raw.split(","):
-        entry = entry.strip()
+    for entry in entries:
+        entry = str(entry).strip()
         if not entry:
             continue
         try:
             networks.append(ipaddress.ip_network(entry, strict=False))
         except ValueError:
             logger.error(
-                "Invalid entry in ALLOWED_IPS, skipping: '%s'", entry
+                "Invalid entry in cluster '%s' allowed_ips, "
+                "skipping: '%s'",
+                cluster_name,
+                entry,
             )
     return networks
 
 
-ALLOWED_NETWORKS = _parse_allowed_networks(ALLOWED_IPS_RAW)
-
-if ALLOWED_NETWORKS:
-    logger.info(
-        "IP allow-list enabled — %d network(s): %s",
-        len(ALLOWED_NETWORKS),
-        ", ".join(str(n) for n in ALLOWED_NETWORKS),
-    )
-else:
-    logger.info("IP allow-list is not configured (ALLOWED_IPS is empty)")
-
-# ---------------------------------------------------------------------------
-# Client Certificate Subject Allow-List
-# ---------------------------------------------------------------------------
-
-def _parse_allowed_subjects(raw: str) -> set[str]:
-    """Parse the TLS_ALLOWED_SUBJECTS environment variable.
-
-    Returns a set of lower-cased CN / SAN values that the client
-    certificate must match.  An empty set means subject validation is
-    disabled.
-    """
-    if not raw:
-        return set()
+def _parse_subject_list(entries: list) -> set[str]:
+    """Parse a list of CN / SAN strings into a lower-cased set."""
     subjects: set[str] = set()
-    for entry in raw.split(","):
-        entry = entry.strip()
+    for entry in entries:
+        entry = str(entry).strip()
         if entry:
             subjects.add(entry.lower())
     return subjects
 
 
-ALLOWED_SUBJECTS = _parse_allowed_subjects(TLS_ALLOWED_SUBJECTS_RAW)
+def _parse_clusters(raw_clusters: dict) -> list[ClusterConfig]:
+    """Build :class:`ClusterConfig` objects from the ``clusters`` mapping
+    in the YAML configuration file.
 
-if ALLOWED_SUBJECTS:
-    logger.info(
-        "Client certificate subject validation enabled — %d subject(s): %s",
-        len(ALLOWED_SUBJECTS),
-        ", ".join(sorted(ALLOWED_SUBJECTS)),
-    )
+    Each key is a human-readable cluster name; the value is a dict with
+    optional keys ``allowed_ips``, ``allowed_subjects``, and ``ca_file``.
+    """
+    clusters: list[ClusterConfig] = []
+    if not raw_clusters:
+        return clusters
+
+    if not isinstance(raw_clusters, dict):
+        logger.error(
+            "'clusters' in config must be a YAML mapping (got %s)",
+            type(raw_clusters).__name__,
+        )
+        sys.exit(1)
+
+    for name, cfg in raw_clusters.items():
+        if not isinstance(cfg, dict):
+            logger.error(
+                "Cluster '%s' must be a YAML mapping (got %s)",
+                name,
+                type(cfg).__name__,
+            )
+            sys.exit(1)
+
+        networks = _parse_network_list(
+            cfg.get("allowed_ips", []), str(name)
+        )
+        subjects = _parse_subject_list(
+            cfg.get("allowed_subjects", [])
+        )
+        ca_file = cfg.get("ca_file")
+        ca_subject = None
+        if ca_file is not None:
+            ca_file = str(ca_file)
+            if os.path.isfile(ca_file):
+                ca_subject = _load_ca_subject(ca_file, str(name))
+            else:
+                logger.error(
+                    "Cluster '%s': CA file not found: %s", name, ca_file
+                )
+                sys.exit(1)
+
+        clusters.append(
+            ClusterConfig(
+                name=str(name),
+                allowed_networks=networks,
+                allowed_subjects=subjects,
+                ca_file=ca_file,
+                ca_subject=ca_subject,
+            )
+        )
+    return clusters
+
+
+CLUSTERS: list[ClusterConfig] = _parse_clusters(
+    _config.get("clusters", {})
+)
+
+if CLUSTERS:
+    for _cl in CLUSTERS:
+        _parts: list[str] = []
+        if _cl.allowed_networks:
+            _parts.append(
+                f"{len(_cl.allowed_networks)} network(s): "
+                + ", ".join(str(n) for n in _cl.allowed_networks)
+            )
+        if _cl.allowed_subjects:
+            _parts.append(
+                f"{len(_cl.allowed_subjects)} subject(s): "
+                + ", ".join(sorted(_cl.allowed_subjects))
+            )
+        if _cl.ca_file:
+            _parts.append(f"CA: {_cl.ca_file}")
+        if _cl.ca_subject:
+            _parts.append("app-layer CA issuer verification: enabled")
+        logger.info(
+            "Cluster '%s' — %s",
+            _cl.name,
+            "; ".join(_parts) if _parts else "no restrictions",
+        )
 else:
     logger.info(
-        "Client certificate subject validation is not configured "
-        "(TLS_ALLOWED_SUBJECTS is empty)"
+        "No clusters defined — IP filtering and certificate "
+        "subject validation are disabled"
     )
+
+
+# ---------------------------------------------------------------------------
+# Combined CA Bundle Generation
+# ---------------------------------------------------------------------------
+
+def _generate_ca_bundle(
+    clusters: list[ClusterConfig], bundle_path: str
+) -> None:
+    """Concatenate all unique cluster CA files into a single PEM bundle.
+
+    The resulting file can be passed to Gunicorn's ``--ca-certs`` option
+    so that the TLS layer trusts client certificates from every
+    configured cluster.
+    """
+    seen: set[str] = set()
+    ca_files: list[str] = []
+    for cluster in clusters:
+        if cluster.ca_file and cluster.ca_file not in seen:
+            seen.add(cluster.ca_file)
+            ca_files.append(cluster.ca_file)
+
+    if not ca_files:
+        logger.info(
+            "No cluster defines ca_file — skipping CA bundle generation"
+        )
+        return
+
+    try:
+        with open(bundle_path, "w", encoding="utf-8") as out:
+            for ca_path in ca_files:
+                with open(ca_path, "r", encoding="utf-8") as ca_fh:
+                    contents = ca_fh.read()
+                    out.write(contents)
+                    if not contents.endswith("\n"):
+                        out.write("\n")
+        logger.info(
+            "Generated combined CA bundle (%d CA file(s)) → %s  "
+            "Use this with Gunicorn: --ca-certs=%s --cert-reqs=2",
+            len(ca_files),
+            bundle_path,
+            bundle_path,
+        )
+    except OSError as exc:
+        logger.warning(
+            "Could not write CA bundle to '%s': %s  "
+            "You can manually concatenate your cluster CA files for "
+            "Gunicorn's --ca-certs option.",
+            bundle_path,
+            exc,
+        )
+
+
+CA_BUNDLE_PATH: str | None = _config.get("ca_bundle_path")
+if CA_BUNDLE_PATH and CLUSTERS:
+    _generate_ca_bundle(CLUSTERS, CA_BUNDLE_PATH)
 
 
 # ===========================================================================
@@ -287,21 +455,32 @@ app = Flask(__name__)
 
 
 @app.before_request
-def _enforce_ip_allowlist():
-    """Reject requests from IPs not in the allow-list (when configured).
+def _enforce_cluster_access():
+    """Enforce per-cluster IP and certificate subject access rules.
 
-    This applies to the ``/curri`` endpoint only — the ``/health``
-    endpoint remains open so that load-balancer and Docker health
-    checks continue to work from any source.
+    When clusters are defined in the configuration file, every request
+    to the ``/curri`` endpoint must match **at least one** cluster.
+    Matching means satisfying all of the cluster's defined rules:
 
-    Returns ``403 Forbidden`` for denied requests.
+        1. If the cluster specifies ``allowed_ips``, the client IP must
+           be within one of those networks.
+        2. If the cluster specifies ``allowed_subjects``, the client
+           certificate must contain at least one matching CN or SAN.
+
+    The ``/health`` endpoint is always exempt so that load-balancer and
+    Docker health checks continue to work from any source.
+
+    When no clusters are configured, access is unrestricted.
+
+    Returns ``403 Forbidden`` if the request does not match any cluster.
     """
-    if not ALLOWED_NETWORKS:
+    if not CLUSTERS:
         return None
 
     if request.path == "/health":
         return None
 
+    # --- Parse client IP ---
     client_ip_str = request.remote_addr
     try:
         client_ip = ipaddress.ip_address(client_ip_str)
@@ -312,71 +491,80 @@ def _enforce_ip_allowlist():
         )
         return Response("Forbidden\n", status=403, mimetype="text/plain")
 
-    for network in ALLOWED_NETWORKS:
-        if client_ip in network:
-            return None
+    # --- Lazily obtain client certificate (only if needed) ---
+    need_cert = any(
+        c.allowed_subjects or c.ca_subject for c in CLUSTERS
+    )
+    cert: dict | None = None
+    cert_subjects: set[str] | None = None
+    if need_cert:
+        cert = _get_peer_certificate()
+        cert_subjects = _get_cert_subjects(cert) if cert else None
 
+    # --- Check each cluster until one matches ---
+    for cluster in CLUSTERS:
+        # 1. IP check
+        if cluster.allowed_networks:
+            if not any(client_ip in net for net in cluster.allowed_networks):
+                logger.debug(
+                    "Cluster '%s': IP %s not in allowed_ips",
+                    cluster.name,
+                    client_ip_str,
+                )
+                continue
+
+        # 2. Certificate subject check
+        if cluster.allowed_subjects:
+            if cert_subjects is None:
+                logger.debug(
+                    "Cluster '%s': subject validation required but "
+                    "client certificate is not accessible",
+                    cluster.name,
+                )
+                continue
+            if not (cert_subjects & cluster.allowed_subjects):
+                logger.debug(
+                    "Cluster '%s': cert subjects %s do not match "
+                    "allowed_subjects %s",
+                    cluster.name,
+                    sorted(cert_subjects),
+                    sorted(cluster.allowed_subjects),
+                )
+                continue
+
+        # 3. CA issuer check (application-layer CA verification)
+        if cluster.ca_subject:
+            if cert is None:
+                logger.debug(
+                    "Cluster '%s': CA issuer verification required "
+                    "but client certificate is not accessible",
+                    cluster.name,
+                )
+                continue
+            cert_issuer = cert.get("issuer")
+            if cert_issuer != cluster.ca_subject:
+                logger.debug(
+                    "Cluster '%s': cert issuer does not match "
+                    "cluster CA subject",
+                    cluster.name,
+                )
+                continue
+
+        # All defined rules passed — request is authorized.
+        logger.debug(
+            "Request from %s authorized via cluster '%s'",
+            client_ip_str,
+            cluster.name,
+        )
+        return None
+
+    # --- No cluster matched — deny ---
     logger.warning(
-        "Denied request from %s to %s (not in ALLOWED_IPS)",
+        "Denied request from %s to %s — no matching cluster "
+        "(checked %d cluster(s))",
         client_ip_str,
         request.path,
-    )
-    return Response("Forbidden\n", status=403, mimetype="text/plain")
-
-
-@app.before_request
-def _enforce_client_cert_subject():
-    """Reject requests whose client certificate CN/SAN is not in the allow-list.
-
-    When ``TLS_ALLOWED_SUBJECTS`` is configured, this hook extracts the
-    peer certificate from the TLS connection and checks that at least one
-    of its Common Name (CN) or Subject Alternative Name (SAN) values
-    matches an entry in the allow-list.
-
-    This prevents hosts that happen to hold a certificate signed by the
-    same CA — but are not authorized UCM servers — from reaching the
-    ``/curri`` endpoint.
-
-    The ``/health`` endpoint is exempt so that health checks continue
-    to work regardless of certificate subject.
-
-    Returns ``403 Forbidden`` if the certificate subject does not match.
-    """
-    if not ALLOWED_SUBJECTS:
-        return None
-
-    if request.path == "/health":
-        return None
-
-    cert = _get_peer_certificate()
-    if cert is None:
-        # The peer certificate could not be read from the WSGI environ.
-        # This can happen when TLS is terminated by a reverse proxy or
-        # when running in plain HTTP mode.  Fail closed: deny the
-        # request because subject validation was explicitly requested.
-        logger.warning(
-            "TLS_ALLOWED_SUBJECTS is configured but the client "
-            "certificate is not accessible — denying request to %s.  "
-            "Ensure mTLS is enabled and the server exposes the peer "
-            "certificate (Gunicorn or Flask dev server with TLS_CA_FILE).",
-            request.path,
-        )
-        return Response("Forbidden\n", status=403, mimetype="text/plain")
-
-    cert_subjects = _get_cert_subjects(cert)
-    if cert_subjects & ALLOWED_SUBJECTS:
-        logger.debug(
-            "Client certificate subject OK: %s",
-            cert_subjects & ALLOWED_SUBJECTS,
-        )
-        return None
-
-    logger.warning(
-        "Denied request to %s — client certificate subjects %s "
-        "do not match TLS_ALLOWED_SUBJECTS %s",
-        request.path,
-        sorted(cert_subjects),
-        sorted(ALLOWED_SUBJECTS),
+        len(CLUSTERS),
     )
     return Response("Forbidden\n", status=403, mimetype="text/plain")
 
@@ -395,8 +583,8 @@ prefix_trie: "PrefixTrie | None" = None
 class PrefixTrie:
     """A trie (prefix tree) for efficient longest-prefix phone number matching.
 
-    Each node in the trie represents a single digit.  Nodes that correspond
-    to the end of a registered prefix store a display name.  Lookup walks
+    Each node in the trie represents a single digit. Nodes that correspond
+    to the end of a registered prefix store a display name. Lookup walks
     the trie character-by-character and remembers the last (i.e. longest)
     prefix that had a name, giving O(m) performance where *m* is the length
     of the phone number being looked up.
@@ -422,7 +610,7 @@ class PrefixTrie:
         """Return the display name for the longest prefix matching *number*.
 
         Walks the trie digit-by-digit and tracks the most recent node that
-        stores a display name.  Returns ``None`` if no prefix matches.
+        stores a display name. Returns ``None`` if no prefix matches.
         """
         node = self._root
         result: str | None = None
@@ -458,9 +646,9 @@ def load_phone_directory(
 
     When ``match_type`` is ``exact`` (or the column is absent), the
     incoming calling number must match the normalized phone number
-    exactly.  When ``match_type`` is ``prefix``, the phone number is
+    exactly. When ``match_type`` is ``prefix``, the phone number is
     treated as a digit prefix — any incoming number that *starts with*
-    those digits will match.  Exact matches are always evaluated before
+    those digits will match. Exact matches are always evaluated before
     prefix matches, and the *longest* matching prefix wins.
 
     Phone numbers are normalized by stripping whitespace, dashes,
@@ -577,7 +765,7 @@ def normalize_phone_number(phone: str) -> str:
     """Normalize a phone number for consistent matching.
 
     Strips whitespace and removes common formatting characters:
-    ``-``, ``(``, ``)``, ``.``, and spaces.  A leading ``+`` is
+    ``-``, ``(``, ``)``, ``.``, and spaces. A leading ``+`` is
     preserved because it is a valid component of E.164 numbers.
 
     Examples::
@@ -685,7 +873,7 @@ def get_calling_number(attributes: dict[str, str]) -> str | None:
 def build_continue_response(display_name: str | None = None) -> str:
     """Build a CURRI XACML response with a Permit / Continue directive.
 
-    The response **always** permits the call to continue.  If a
+    The response **always** permits the call to continue. If a
     ``display_name`` is provided, the embedded CIXML obligation includes
     a ``<modify>`` element that instructs UCM to update the calling party
     display name shown on the receiving phone.
@@ -717,7 +905,7 @@ def build_continue_response(display_name: str | None = None) -> str:
     """
     if display_name:
         # Step 1 – Escape the display name for safe use inside an XML
-        #          attribute value at the CIXML level.  This prevents
+        #          attribute value at the CIXML level. This prevents
         #          XML injection if the name contains special characters.
         safe_name = xml_escape(display_name, {'"': "&quot;", "'": "&apos;"})
 
@@ -738,7 +926,7 @@ def build_continue_response(display_name: str | None = None) -> str:
         logger.info("Building simple continue response (no name match)")
 
     # Step 3 – Entity-encode the CIXML for embedding inside the XACML
-    #          <AttributeValue> text content.  UCM will decode these
+    #          <AttributeValue> text content. UCM will decode these
     #          entities to recover the original CIXML XML and parse it.
     cixml_encoded = xml_escape(cixml_raw)
 
@@ -782,7 +970,7 @@ def lookup_display_name(calling_number: str) -> str | None:
            with ``match_type=exact`` (or no ``match_type`` column).
         2. **Longest prefix match** — O(m) trie walk (where *m* is the
            digit length of the number) against numbers loaded with
-           ``match_type=prefix``.  The longest matching prefix wins.
+           ``match_type=prefix``. The longest matching prefix wins.
 
     Args:
         calling_number: The raw calling party number from the CURRI request.
@@ -904,7 +1092,7 @@ def health_check():
     """Simple health-check endpoint.
 
     Returns the service status and the number of entries currently loaded
-    in the phone directory.  Useful for monitoring and load-balancer
+    in the phone directory. Useful for monitoring and load-balancer
     health probes.
 
     Returns:
@@ -933,7 +1121,7 @@ def initialize_app():
         exact_directory, prefix_trie = load_phone_directory(CSV_FILE_PATH)
     except FileNotFoundError:
         logger.error(
-            "Cannot start without a phone directory.  "
+            "Cannot start without a phone directory. "
             "Please create '%s' or set the CSV_FILE_PATH environment variable.",
             CSV_FILE_PATH,
         )
@@ -967,27 +1155,44 @@ if __name__ == "__main__":
             )
 
             # --- Mutual TLS (mTLS) ---
-            # When TLS_CA_FILE is set, require connecting clients to
-            # present a certificate signed by the specified CA.  For UCM
-            # this should be the exported CallManager.pem certificate.
-            if TLS_CA_FILE:
-                if os.path.isfile(TLS_CA_FILE):
-                    ssl_context.load_verify_locations(TLS_CA_FILE)
-                    ssl_context.verify_mode = ssl.CERT_REQUIRED
-                    logger.info(
-                        "Mutual TLS enabled — clients must present a "
-                        "certificate signed by CA: %s",
-                        TLS_CA_FILE,
-                    )
-                else:
-                    logger.error(
-                        "TLS CA file not found: %s", TLS_CA_FILE
-                    )
-                    sys.exit(1)
+            # Load CA certificates from all clusters that define a
+            # ca_file. Each call to load_verify_locations() adds to
+            # the trust store, so clients from any configured cluster
+            # will be accepted at the TLS layer. Application-level
+            # cluster matching (IP + subject) provides further filtering.
+            ca_loaded = False
+            seen_ca_files: set[str] = set()
+            for cluster in CLUSTERS:
+                if cluster.ca_file:
+                    if cluster.ca_file in seen_ca_files:
+                        continue
+                    seen_ca_files.add(cluster.ca_file)
+                    if os.path.isfile(cluster.ca_file):
+                        ssl_context.load_verify_locations(cluster.ca_file)
+                        ca_loaded = True
+                        logger.info(
+                            "Loaded CA for cluster '%s': %s",
+                            cluster.name,
+                            cluster.ca_file,
+                        )
+                    else:
+                        logger.error(
+                            "CA file not found for cluster '%s': %s",
+                            cluster.name,
+                            cluster.ca_file,
+                        )
+                        sys.exit(1)
+
+            if ca_loaded:
+                ssl_context.verify_mode = ssl.CERT_REQUIRED
+                logger.info(
+                    "Mutual TLS enabled — clients must present a "
+                    "certificate signed by a configured cluster CA"
+                )
             else:
                 logger.info(
-                    "Mutual TLS is not configured (TLS_CA_FILE not set). "
-                    "Client certificates will not be verified."
+                    "Mutual TLS is not configured (no cluster defines "
+                    "ca_file). Client certificates will not be verified."
                 )
         else:
             logger.error(
@@ -998,9 +1203,10 @@ if __name__ == "__main__":
             sys.exit(1)
     else:
         logger.warning(
-            "TLS is not configured – running in plaintext HTTP mode.  "
-            "Set TLS_CERT_FILE and TLS_KEY_FILE for HTTPS, or use "
-            "Gunicorn's --certfile / --keyfile options in production."
+            "TLS is not configured – running in plaintext HTTP mode. "
+            "Set tls_cert_file and tls_key_file in %s for HTTPS, or use "
+            "Gunicorn's --certfile / --keyfile options in production.",
+            CONFIG_FILE,
         )
 
     app.run(

@@ -1,0 +1,17 @@
+# Local configuration (copy config.yaml.example to config.yaml and customize)
+config.yaml
+
+# Generated certificates and keys (see setup_certs.sh)
+certs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

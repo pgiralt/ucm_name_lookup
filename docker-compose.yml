@@ -5,7 +5,6 @@ services:
     ports:
       - "5015:80"
     volumes:
+      - ./config.yaml:/app/config.yaml:ro
       - ./phone_directory.csv:/app/phone_directory.csv:ro
-    environment:
-      - LOG_LEVEL=INFO
     restart: unless-stopped

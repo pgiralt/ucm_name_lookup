@@ -1,0 +1,90 @@
+# ===========================================================================
+# UCM Name Lookup Service — Configuration (Example)
+# ===========================================================================
+#
+# Copy this file to config.yaml and customize for your environment:
+#
+#   cp config.yaml.example config.yaml
+#
+# config.yaml is gitignored so your local settings won't conflict with
+# upstream changes.
+#
+# This file contains all non-sensitive configuration for the service.
+# Sensitive values (TLS private keys) should be provided via Gunicorn
+# command-line arguments or environment variables — never in this file.
+#
+# Specify a custom path to this file with the CONFIG_FILE environment
+# variable (default: config.yaml).
+#
+# The LOG_LEVEL environment variable, if set, overrides the value here.
+# ===========================================================================
+
+# Path to the phone directory CSV file.
+csv_file_path: phone_directory.csv
+
+# Logging level: DEBUG, INFO, WARNING, ERROR
+log_level: INFO
+
+# Flask development server bind address and port.
+flask_host: 0.0.0.0
+flask_port: 5000
+
+# TLS certificate and key for the Flask development server.
+# For production, configure TLS through Gunicorn's --certfile / --keyfile.
+# tls_cert_file: certs/server.crt
+# tls_key_file: certs/server.key
+
+# ---------------------------------------------------------------------------
+# UCM Cluster Definitions
+# ---------------------------------------------------------------------------
+#
+# Each cluster entry defines the access rules for one UCM cluster.
+# A connecting client must match ALL rules defined for at least ONE cluster
+# to be granted access to the /curri endpoint.
+#
+# Per-cluster settings:
+#   allowed_ips      - List of IP addresses and/or CIDR networks whose
+#                      requests are accepted. When defined, only these
+#                      source IPs are permitted for this cluster.
+#   ca_file          - Path to the CA certificate (PEM) that signed the
+#                      client certificates for this cluster. Used by the
+#                      Flask dev server to build the mTLS trust store.
+#                      For Gunicorn, concatenate all cluster CA files into
+#                      a single bundle and pass it via --ca-certs.
+#   allowed_subjects - List of expected Common Name (CN) and/or Subject
+#                      Alternative Name (SAN) values for client certificates
+#                      from this cluster. When defined, the connecting
+#                      client's certificate must contain at least one
+#                      matching CN or SAN entry.
+#
+# When no clusters are defined, IP filtering and certificate subject
+# validation are disabled (all clients are accepted).
+#
+# Example:
+#
+# clusters:
+#   headquarters:
+#     allowed_ips:
+#       - 10.1.1.10
+#       - 10.1.1.11
+#       - 10.1.2.0/24
+#     ca_file: certs/hq-CallManager.pem
+#     allowed_subjects:
+#       - cucm-pub.example.com
+#       - cucm-sub1.example.com
+#       - cucm-sub2.example.com
+#
+#   branch-office:
+#     allowed_ips:
+#       - 10.2.1.0/24
+#     ca_file: certs/branch-CallManager.pem
+#     allowed_subjects:
+#       - cucm-branch.example.com
+#
+# Optional: path to write a combined CA bundle file at startup.
+# When set, the application concatenates all unique cluster ca_file
+# entries into a single PEM file at this path. Use this file with
+# Gunicorn's --ca-certs option for production mTLS.
+# ca_bundle_path: certs/ca-bundle.pem
+
+clusters: {}

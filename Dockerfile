@@ -29,10 +29,10 @@
 #       -e GUNICORN_CMD_ARGS="--certfile=/app/certs/server.crt --keyfile=/app/certs/server.key --ca-certs=/app/certs/ca.pem --cert-reqs=2 --bind=0.0.0.0:443" \
 #       ucm-name-lookup
 #
-# Run (with IP allow-list – restrict to specific UCM cluster nodes):
+# Run (with custom config – define clusters, IP allow-lists, etc.):
 #   docker run -p 80:80 \
+#       -v /path/to/config.yaml:/app/config.yaml:ro \
 #       -v /path/to/phone_directory.csv:/app/phone_directory.csv:ro \
-#       -e ALLOWED_IPS="10.1.1.10,10.1.1.11,10.1.2.0/24" \
 #       ucm-name-lookup
 # ---------------------------------------------------------------------------
 
@@ -65,11 +65,12 @@ RUN groupadd --gid 1000 appuser \
 
 WORKDIR /app
 
-# Copy application code.
+# Copy application code and default configuration.
 COPY main.py .
+COPY config.yaml.example config.yaml
 
 # Copy the sample phone directory.  In production, mount your own CSV
-# over this file via a Docker volume or bind mount.
+# and config.yaml over these files via Docker volumes or bind mounts.
 COPY phone_directory.csv .
 
 # Switch to non-root user.
