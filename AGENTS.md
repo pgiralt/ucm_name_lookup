@@ -27,6 +27,8 @@ A **CURRI** (Cisco Unified Routing Rules Interface) server that provides phone n
 | `Dockerfile` | Multi-stage production image with Gunicorn |
 | `docker-compose.yml` | Development/deployment compose file |
 | `setup_certs.sh` | Certificate helper script — generates self-signed certs or CSRs for mTLS setup |
+| `gunicorn.conf.py` | Gunicorn config — auto-detects TLS/mTLS from config.yaml, generates CA bundle before bind |
+| `healthcheck.py` | Docker HEALTHCHECK script — auto-detects HTTP vs HTTPS |
 | `README.md` | Full user-facing documentation |
 
 ## Architecture Decisions
@@ -98,11 +100,13 @@ Numbers are normalized (strip formatting chars, preserve leading `+`) before loo
 
 - Authentication uses mutual TLS — the only auth mechanism in CURRI
 - `setup_certs.sh` automates server certificate generation (two modes: self-signed or CSR)
+- `gunicorn.conf.py` auto-detects TLS cert/key and CA bundle; generates the CA bundle before Gunicorn binds
 - UCM's `CallManager.pem` is the CA cert to trust
 - The service's TLS cert must be imported into UCM's `CallManager-trust` store
 - Dev server: cluster `ca_file` entries are loaded into the SSLContext directly
-- Production: concatenate all cluster CAs into a bundle for Gunicorn's `--ca-certs`
+- Production: `gunicorn.conf.py` handles CA bundle generation and `--ca-certs` automatically
 - Generated certs go in `certs/` (gitignored)
+- In Docker, set `ca_bundle_path` to a writable path (e.g., `/tmp/ca-bundle.pem`) since `certs/` is mounted read-only
 
 ## Important Conventions
 
@@ -131,12 +135,8 @@ python main.py
 # Set tls_cert_file and tls_key_file in config.yaml, plus cluster ca_file entries
 python main.py
 
-# Production
-gunicorn -w 4 --threads 4 --worker-class gthread \
-    -b 0.0.0.0:443 \
-    --certfile=certs/server.crt --keyfile=certs/server.key \
-    --ca-certs=certs/ca-bundle.pem --cert-reqs=2 \
-    main:app
+# Production (gunicorn.conf.py auto-detects TLS/mTLS from config.yaml)
+gunicorn main:app
 
 # Docker
 docker build -t ucm-name-lookup .

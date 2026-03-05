@@ -199,23 +199,32 @@ clusters:
 python main.py
 ```
 
-**Production (Gunicorn):** Gunicorn requires a single CA bundle file via `--ca-certs`. Set `ca_bundle_path` in `config.yaml` (see Step 4) to have the application **auto-generate** this bundle at startup from all cluster `ca_file` entries.
+**Production (Gunicorn):** The included `gunicorn.conf.py` **automatically detects** TLS certificates and configures Gunicorn accordingly:
+
+- If `certs/server.crt` and `certs/server.key` exist → HTTPS on port 443
+- If `ca_bundle_path` is set and cluster CA files exist → mTLS enabled (client cert required)
+- Otherwise → plain HTTP on port 80
+
+The CA bundle is generated automatically before Gunicorn binds, so no manual `--ca-certs` flag is needed.
 
 ```bash
-gunicorn -w 4 --threads 4 --worker-class gthread \
-    -b 0.0.0.0:443 \
-    --certfile=certs/server.crt \
-    --keyfile=certs/server.key \
-    --ca-certs=certs/ca-bundle.pem \
-    --cert-reqs=2 \
-    main:app
+# Just run Gunicorn — gunicorn.conf.py handles the rest:
+gunicorn main:app
 ```
 
-The `--cert-reqs=2` flag tells Gunicorn to **require** a valid client certificate (equivalent to `ssl.CERT_REQUIRED`). Connections without a valid certificate signed by one of the CAs in the bundle are rejected at the TLS layer before reaching the application.
+Override any setting via the `GUNICORN_CMD_ARGS` environment variable or by passing explicit CLI flags.
 
-> **Note:** If you prefer to build the bundle manually: `cat certs/hq-CallManager.pem certs/branch-CallManager.pem > certs/ca-bundle.pem`
+> **Note:** If you prefer to manage TLS manually, you can pass explicit flags that override `gunicorn.conf.py`:
+> ```bash
+> gunicorn --certfile=certs/server.crt --keyfile=certs/server.key \
+>     --ca-certs=certs/ca-bundle.pem --cert-reqs=2 \
+>     -b 0.0.0.0:443 main:app
+> ```
 
 **Docker Compose (mTLS):**
+
+TLS and mTLS are enabled automatically when the `certs/` directory contains the server certificate, key, and cluster CA files. Set `ca_bundle_path` to a writable path (e.g., `/tmp/ca-bundle.pem`) in `config.yaml` so the auto-generated bundle can be written inside the container.
+
 ```yaml
 services:
   ucm-name-lookup:
@@ -226,14 +235,11 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./phone_directory.csv:/app/phone_directory.csv:ro
-      - ./certs/server.crt:/app/certs/server.crt:ro
-      - ./certs/server.key:/app/certs/server.key:ro
-      - ./certs/hq-CallManager.pem:/app/certs/hq-CallManager.pem:ro
-      - ./certs/ca-bundle.pem:/app/certs/ca-bundle.pem:ro
-    environment:
-      - GUNICORN_CMD_ARGS=--certfile=/app/certs/server.crt --keyfile=/app/certs/server.key --ca-certs=/app/certs/ca-bundle.pem --cert-reqs=2 --bind=0.0.0.0:443
+      - ./certs:/app/certs:ro
     restart: unless-stopped
 ```
+
+No `GUNICORN_CMD_ARGS` needed — `gunicorn.conf.py` reads `config.yaml` and auto-configures everything.
 
 ### Application-Layer CA Verification
 

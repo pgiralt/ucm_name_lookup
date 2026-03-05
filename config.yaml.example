@@ -85,6 +85,8 @@ flask_port: 5000
 # When set, the application concatenates all unique cluster ca_file
 # entries into a single PEM file at this path. Use this file with
 # Gunicorn's --ca-certs option for production mTLS.
+# Note: in Docker, if certs/ is mounted read-only, use a writable
+# path such as /tmp/ca-bundle.pem instead.
 # ca_bundle_path: certs/ca-bundle.pem
 
 clusters: {}

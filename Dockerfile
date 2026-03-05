@@ -65,38 +65,31 @@ RUN groupadd --gid 1000 appuser \
 
 WORKDIR /app
 
-# Copy application code and default configuration.
-COPY main.py .
+# Copy application code, Gunicorn config, and default configuration.
+COPY main.py gunicorn.conf.py healthcheck.py ./
 COPY config.yaml.example config.yaml
 
-# Copy the sample phone directory.  In production, mount your own CSV
+# Copy the sample phone directory. In production, mount your own CSV
 # and config.yaml over these files via Docker volumes or bind mounts.
 COPY phone_directory.csv .
 
 # Switch to non-root user.
 USER appuser
 
-# Expose the default HTTP port.  Override with GUNICORN_CMD_ARGS for HTTPS.
-EXPOSE 80
+# Expose HTTP and HTTPS ports. gunicorn.conf.py auto-selects the port
+# based on whether TLS certificates are present (80 = HTTP, 443 = HTTPS).
+EXPOSE 80 443
 
-# Health-check: hit the /health endpoint every 30 seconds.
+# Health-check: auto-detects HTTP vs HTTPS from config.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:80/health')" || exit 1
+    CMD python healthcheck.py || exit 1
 
-# Start Gunicorn with gthread workers bound to port 80.
-# gthread prevents bare TCP connections (e.g. network probes) from
-# tying up an entire worker process – only one thread is blocked.
-# The default 4 workers × 4 threads = 16 concurrent connections.
+# Start Gunicorn. All settings (workers, bind, TLS) are in gunicorn.conf.py
+# which is auto-loaded from the working directory. TLS and mTLS are enabled
+# automatically when certificate files are present.
+#
+# gunicorn.conf.py defaults: 4 workers × 4 threads = 16 concurrent connections.
 # Adjust workers × threads to match the UCM service parameter
 # "External Call Control Maximum Connection Count to PDP" (max 20).
-# Override any of these at runtime via the GUNICORN_CMD_ARGS env var.
-CMD ["gunicorn", \
-     "--workers=4", \
-     "--threads=4", \
-     "--worker-class=gthread", \
-     "--bind=0.0.0.0:80", \
-     "--worker-tmp-dir=/dev/shm", \
-     "--timeout=30", \
-     "--access-logfile=-", \
-     "--error-logfile=-", \
-     "main:app"]
+# Override any setting at runtime via the GUNICORN_CMD_ARGS env var.
+CMD ["gunicorn", "main:app"]
