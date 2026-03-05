@@ -77,6 +77,10 @@ if _bundle_path and isinstance(_clusters, dict):
 # Auto-detect TLS
 # ---------------------------------------------------------------------------
 
+_log_level = os.environ.get(
+    "LOG_LEVEL", _config.get("log_level", "INFO")
+).upper()
+
 if os.path.isfile(_cert) and os.path.isfile(_key):
     certfile = _cert
     keyfile = _key
@@ -89,3 +93,106 @@ if os.path.isfile(_cert) and os.path.isfile(_key):
     if _bundle_path and os.path.isfile(_bundle_path):
         ca_certs = _bundle_path
         cert_reqs = ssl.CERT_REQUIRED
+
+    # --- TLS debug diagnostics (only when LOG_LEVEL=DEBUG) ---
+    if _log_level == "DEBUG":
+        print("[DEBUG] gunicorn TLS configuration:")
+        print(f"  certfile  = {_cert}")
+        print(f"  keyfile   = {_key}")
+        print(f"  ca_certs  = {_bundle_path or '<none>'}")
+        print(
+            f"  cert_reqs = "
+            f"{'CERT_REQUIRED' if _bundle_path and os.path.isfile(_bundle_path) else 'none (no mTLS)'}"
+        )
+        if _bundle_path and os.path.isfile(_bundle_path):
+            try:
+                _dbg_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                _dbg_ctx.load_verify_locations(_bundle_path)
+                _dbg_ca_list = _dbg_ctx.get_ca_certs()
+                print(
+                    f"[DEBUG] CA bundle contains "
+                    f"{len(_dbg_ca_list)} CA certificate(s):"
+                )
+                for _i, _ca in enumerate(_dbg_ca_list, 1):
+                    _subj_parts = []
+                    for _rdn in _ca.get("subject", ()):
+                        for _at, _av in _rdn:
+                            _subj_parts.append(f"{_at}={_av}")
+                    _iss_parts = []
+                    for _rdn in _ca.get("issuer", ()):
+                        for _at, _av in _rdn:
+                            _iss_parts.append(f"{_at}={_av}")
+                    print(
+                        f"  [{_i}] Subject: "
+                        f"{', '.join(_subj_parts) or '<empty>'}"
+                    )
+                    print(
+                        f"       Issuer : "
+                        f"{', '.join(_iss_parts) or '<empty>'}"
+                    )
+                    print(
+                        f"       Serial : "
+                        f"{_ca.get('serialNumber', '<unknown>')}"
+                    )
+                    print(
+                        f"       Valid  : "
+                        f"{_ca.get('notBefore', '?')} → "
+                        f"{_ca.get('notAfter', '?')}"
+                    )
+                # Also check for leaf certs in the bundle
+                import re as _re
+                with open(_bundle_path, "r", encoding="utf-8") as _bf:
+                    _pem = _bf.read()
+                _blocks = _re.findall(
+                    r"(-----BEGIN CERTIFICATE-----"
+                    r".*?"
+                    r"-----END CERTIFICATE-----)",
+                    _pem,
+                    _re.DOTALL,
+                )
+                import tempfile as _tf
+                _leaf_n = 0
+                for _blk in _blocks:
+                    with _tf.NamedTemporaryFile(
+                        mode="w", suffix=".pem", delete=True
+                    ) as _tmp:
+                        _tmp.write(_blk)
+                        _tmp.flush()
+                        try:
+                            _cd = ssl._ssl._test_decode_cert(
+                                _tmp.name
+                            )
+                            _tc = ssl.SSLContext(
+                                ssl.PROTOCOL_TLS_CLIENT
+                            )
+                            _tc.load_verify_locations(_tmp.name)
+                            if _cd and not _tc.get_ca_certs():
+                                _leaf_n += 1
+                                _sp = []
+                                for _r in _cd.get("subject", ()):
+                                    for _a, _v in _r:
+                                        _sp.append(f"{_a}={_v}")
+                                _ip = []
+                                for _r in _cd.get("issuer", ()):
+                                    for _a, _v in _r:
+                                        _ip.append(f"{_a}={_v}")
+                                print(
+                                    f"  [leaf-{_leaf_n}] Subject: "
+                                    f"{', '.join(_sp)}"
+                                )
+                                print(
+                                    f"              Issuer : "
+                                    f"{', '.join(_ip)}"
+                                )
+                        except Exception:
+                            pass
+                if _leaf_n:
+                    print(
+                        f"[DEBUG] Bundle also contains "
+                        f"{_leaf_n} leaf certificate(s) "
+                        f"(not CA — used for identity matching)"
+                    )
+            except Exception as _exc:
+                print(
+                    f"[DEBUG] Could not inspect CA bundle: {_exc}"
+                )

@@ -449,6 +449,39 @@ services:
 | `HEAD` | `/curri` | Keepalive probe — returns `200 OK` (used by UCM to check service availability) |
 | `GET` | `/health` | Health check — returns JSON with service status and directory entry count. **Localhost only** when clusters are defined |
 
+## Troubleshooting TLS / mTLS
+
+When diagnosing certificate verification errors such as `unable to get local issuer certificate`, set `LOG_LEVEL` to `DEBUG` to enable detailed TLS diagnostics:
+
+```bash
+# Via environment variable
+LOG_LEVEL=DEBUG docker compose up
+
+# Or in config.yaml
+log_level: DEBUG
+```
+
+At **DEBUG** level the service logs:
+
+- **Startup (Gunicorn and dev server):** the TLS configuration (cert, key, CA bundle path, cert_reqs mode) and the full details of every certificate in the CA trust store — subject, issuer, serial number, and validity dates. Both CA and leaf certificates in the bundle are listed.
+- **Per-request:** the connecting client's certificate details — subject, issuer, serial, validity, and SANs — plus the cluster-matching decisions (IP check, subject check, issuer/identity check).
+
+This makes it easy to spot mismatches between the client certificate's issuer and the CAs in the trust store.
+
+> **Tip:** You can also inspect certificates directly with OpenSSL:
+> ```bash
+> # View the CA bundle contents
+> openssl crl2pkcs7 -nocrl -certfile /tmp/ca-bundle.pem | \
+>   openssl pkcs7 -print_certs -noout
+>
+> # View a single certificate
+> openssl x509 -text -noout -in certs/server.crt
+>
+> # Test the TLS handshake with a client cert
+> openssl s_client -connect localhost:443 \
+>   -cert client.crt -key client.key -CAfile ca.pem
+> ```
+
 ## Testing with curl
 
 ```bash

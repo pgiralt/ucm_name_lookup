@@ -49,8 +49,10 @@ import csv
 import ipaddress
 import logging
 import os
+import re
 import ssl
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from xml.sax.saxutils import escape as xml_escape
 
@@ -420,14 +422,167 @@ def _generate_ca_bundle(
         )
 
 
+def _log_ca_bundle_contents(bundle_path: str) -> None:
+    """Parse a PEM CA bundle and log each certificate at DEBUG level.
+
+    This is the primary diagnostic tool for ``unable to get local
+    issuer certificate`` errors — it shows exactly which CAs the TLS
+    layer will trust during the handshake.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    if not os.path.isfile(bundle_path):
+        logger.debug("CA bundle file not found: %s", bundle_path)
+        return
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_verify_locations(bundle_path)
+        _log_trusted_ca_certs(ctx)
+    except (ssl.SSLError, OSError) as exc:
+        logger.debug("Could not parse CA bundle '%s': %s", bundle_path, exc)
+
+    # Also log any leaf certificates in the bundle that
+    # get_ca_certs() won't return (CA:FALSE).
+    try:
+        with open(bundle_path, "r", encoding="utf-8") as fh:
+            pem_data = fh.read()
+        pem_blocks = re.findall(
+            r"(-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----)",
+            pem_data,
+            re.DOTALL,
+        )
+        leaf_idx = 0
+        for block in pem_blocks:
+            # Write each cert to a temp context to decode it
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".pem", delete=True
+            ) as tmp:
+                tmp.write(block)
+                tmp.flush()
+                try:
+                    cert_dict = ssl._ssl._test_decode_cert(  # noqa: SLF001
+                        tmp.name
+                    )
+                    if cert_dict:
+                        # Check if this is a leaf cert (not returned
+                        # by get_ca_certs).
+                        test_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                        test_ctx.load_verify_locations(tmp.name)
+                        if not test_ctx.get_ca_certs():
+                            leaf_idx += 1
+                            logger.debug(
+                                "  [leaf-%d] Subject: %s\n"
+                                "            Issuer : %s\n"
+                                "            Serial : %s\n"
+                                "            Valid  : %s → %s",
+                                leaf_idx,
+                                _format_cert_name(
+                                    cert_dict.get("subject")
+                                ),
+                                _format_cert_name(
+                                    cert_dict.get("issuer")
+                                ),
+                                cert_dict.get(
+                                    "serialNumber", "<unknown>"
+                                ),
+                                cert_dict.get(
+                                    "notBefore", "<unknown>"
+                                ),
+                                cert_dict.get(
+                                    "notAfter", "<unknown>"
+                                ),
+                            )
+                except Exception:
+                    pass
+    except Exception as exc:
+        logger.debug(
+            "Could not scan bundle for leaf certs: %s", exc
+        )
+
+
 CA_BUNDLE_PATH: str | None = _config.get("ca_bundle_path")
 if CA_BUNDLE_PATH and CLUSTERS:
     _generate_ca_bundle(CLUSTERS, CA_BUNDLE_PATH)
+    _log_ca_bundle_contents(CA_BUNDLE_PATH)
 
 
 # ===========================================================================
 # Client Certificate Helpers
 # ===========================================================================
+
+def _format_cert_name(name_tuple: tuple | None) -> str:
+    """Format a certificate subject or issuer tuple into a readable string.
+
+    Converts the nested-tuple format from :meth:`ssl.SSLSocket.getpeercert`
+    into an OpenSSL-style one-line distinguished name, e.g.
+    ``CN=server, O=Acme, C=US``.
+    """
+    if not name_tuple:
+        return "<empty>"
+    parts: list[str] = []
+    for rdn in name_tuple:
+        for attr_type, attr_value in rdn:
+            parts.append(f"{attr_type}={attr_value}")
+    return ", ".join(parts) if parts else "<empty>"
+
+
+def _log_cert_details(cert: dict, label: str = "Client") -> None:
+    """Log certificate details at DEBUG level for TLS troubleshooting.
+
+    Outputs subject, issuer, serial number, validity dates, and SAN
+    entries. Never logs private key material.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    logger.debug(
+        "%s certificate details:\n"
+        "  Subject : %s\n"
+        "  Issuer  : %s\n"
+        "  Serial  : %s\n"
+        "  Valid   : %s → %s\n"
+        "  SANs    : %s",
+        label,
+        _format_cert_name(cert.get("subject")),
+        _format_cert_name(cert.get("issuer")),
+        cert.get("serialNumber", "<unknown>"),
+        cert.get("notBefore", "<unknown>"),
+        cert.get("notAfter", "<unknown>"),
+        ", ".join(
+            f"{t}={v}" for t, v in cert.get("subjectAltName", ())
+        ) or "<none>",
+    )
+
+
+def _log_trusted_ca_certs(ssl_ctx: ssl.SSLContext) -> None:
+    """Log the subjects of all CA certificates in the trust store.
+
+    Only produces output at DEBUG level. This helps diagnose
+    ``unable to get local issuer certificate`` errors by showing
+    exactly which CAs the TLS layer will accept.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    ca_certs = ssl_ctx.get_ca_certs()
+    if not ca_certs:
+        logger.debug("TLS trust store: <empty — no CA certs loaded>")
+        return
+    logger.debug(
+        "TLS trust store contains %d CA certificate(s):", len(ca_certs)
+    )
+    for idx, ca in enumerate(ca_certs, 1):
+        logger.debug(
+            "  [%d] Subject: %s\n"
+            "       Issuer : %s\n"
+            "       Serial : %s\n"
+            "       Valid  : %s → %s",
+            idx,
+            _format_cert_name(ca.get("subject")),
+            _format_cert_name(ca.get("issuer")),
+            ca.get("serialNumber", "<unknown>"),
+            ca.get("notBefore", "<unknown>"),
+            ca.get("notAfter", "<unknown>"),
+        )
+
 
 def _get_peer_certificate() -> dict | None:
     """Extract the peer (client) certificate from the current request.
@@ -552,6 +707,13 @@ def _enforce_cluster_access():
     cert_subjects: set[str] | None = None
     if need_cert:
         cert = _get_peer_certificate()
+        if cert:
+            _log_cert_details(cert, "Client")
+        else:
+            logger.debug(
+                "No client certificate available for request from %s",
+                client_ip_str,
+            )
         cert_subjects = _get_cert_subjects(cert) if cert else None
 
     # --- Check each cluster until one matches ---
@@ -1254,6 +1416,7 @@ if __name__ == "__main__":
                     "Mutual TLS enabled — client certificates are "
                     "required for all connections"
                 )
+                _log_trusted_ca_certs(ssl_context)
             else:
                 logger.info(
                     "Mutual TLS is not configured (no cluster defines "

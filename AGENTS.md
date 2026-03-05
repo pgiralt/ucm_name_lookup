@@ -147,6 +147,16 @@ docker build -t ucm-name-lookup .
 docker compose up
 ```
 
+## TLS Debug Logging
+
+Set `LOG_LEVEL=DEBUG` (env var or `log_level: DEBUG` in config.yaml) to enable detailed TLS diagnostics:
+
+- **Gunicorn startup:** prints TLS config (cert, key, CA bundle, cert_reqs) and dumps every certificate in the CA trust store (subject, issuer, serial, validity). Both CA and leaf certs are listed.
+- **App startup:** `_log_ca_bundle_contents()` parses the CA bundle and logs the same details via the `ucm_name_lookup` logger. `_log_trusted_ca_certs()` dumps the SSLContext trust store for the dev server.
+- **Per-request:** `_log_cert_details()` logs the client certificate (subject, issuer, serial, validity, SANs). Cluster-matching decisions (IP, subject, issuer/identity) are also logged at DEBUG.
+
+Helper functions in `main.py`: `_format_cert_name()`, `_log_cert_details()`, `_log_trusted_ca_certs()`, `_log_ca_bundle_contents()`.
+
 ## Testing Notes
 
 - No test suite exists yet — this is an area for future development
