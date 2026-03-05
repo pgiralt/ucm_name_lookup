@@ -220,6 +220,10 @@ if [[ "$MODE" == "csr" ]]; then
     echo "  6. Restart the Cisco CallManager service on each UCM node"
     echo "     for certificate changes to take effect."
     echo ""
+    echo -e "  ${CYAN}Docker note:${RESET} The container runs as uid 1000. Ensure the"
+    echo "  cert files are readable by that user on the deployment server:"
+    echo "    sudo chown 1000:1000 $KEY_FILE $CRT_FILE"
+    echo ""
 
 # ===========================================================================
 # Mode: Self-signed
@@ -266,5 +270,9 @@ else
     echo ""
     echo "  4. Restart the Cisco CallManager service on each UCM node"
     echo "     for certificate changes to take effect."
+    echo ""
+    echo -e "  ${CYAN}Docker note:${RESET} The container runs as uid 1000. Ensure the"
+    echo "  cert files are readable by that user on the deployment server:"
+    echo "    sudo chown 1000:1000 $KEY_FILE $CRT_FILE"
     echo ""
 fi

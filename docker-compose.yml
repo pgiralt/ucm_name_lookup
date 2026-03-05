@@ -2,6 +2,10 @@ services:
   ucm-name-lookup:
     build: .
     container_name: ucm-name-lookup
+    # Run as the UID/GID that owns the cert files so the private key
+    # (chmod 600) is readable. Defaults to 1000 (Dockerfile's appuser).
+    # Override via .env or environment: DOCKER_UID=<uid> DOCKER_GID=<gid>
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
     ports:
       - "5015:80"
     volumes:

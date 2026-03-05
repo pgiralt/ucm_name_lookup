@@ -345,16 +345,19 @@ docker run -p 80:80 \
 ```
 
 **Run (HTTPS):**
+
+`gunicorn.conf.py` auto-detects TLS when cert files are present at `certs/server.crt` and `certs/server.key`. Use `--user` to match the UID that owns the key file (the key is `chmod 600`):
+
 ```bash
 docker run -p 443:443 \
+    --user "$(id -u):$(id -g)" \
+    -v /path/to/config.yaml:/app/config.yaml:ro \
     -v /path/to/phone_directory.csv:/app/phone_directory.csv:ro \
-    -v /path/to/server.crt:/app/certs/server.crt:ro \
-    -v /path/to/server.key:/app/certs/server.key:ro \
-    -e GUNICORN_CMD_ARGS="--certfile=/app/certs/server.crt --keyfile=/app/certs/server.key --bind=0.0.0.0:443" \
+    -v /path/to/certs:/app/certs:ro \
     ucm-name-lookup
 ```
 
-The container runs Gunicorn with 4 gthread workers (4 threads each, 16 total) as a non-root user. The worker temporary directory is set to `/dev/shm` (shared memory) to prevent false worker timeouts caused by slow I/O on Docker's overlay filesystem. Override Gunicorn settings at runtime via the `GUNICORN_CMD_ARGS` environment variable. A built-in Docker `HEALTHCHECK` polls `/health` every 30 seconds.
+The container runs Gunicorn with 4 gthread workers (4 threads each, 16 total). The worker temporary directory is set to `/dev/shm` (shared memory) to prevent false worker timeouts caused by slow I/O on Docker's overlay filesystem. Override Gunicorn settings at runtime via the `GUNICORN_CMD_ARGS` environment variable. A built-in Docker `HEALTHCHECK` polls `/health` every 30 seconds.
 
 ### Docker Compose
 
@@ -393,24 +396,36 @@ docker compose up -d
 
 By default the compose file maps host port **5015** to the container's port 80. To change the host port, edit the `ports` mapping (e.g., `"80:80"` to listen on port 80).
 
-To enable HTTPS via Docker Compose, mount your TLS certificate and key and override the Gunicorn bind address:
+To enable HTTPS via Docker Compose, mount the `certs/` directory. `gunicorn.conf.py` auto-detects the cert/key and switches to HTTPS on port 443:
 
 ```yaml
 services:
   ucm-name-lookup:
     build: .
     container_name: ucm-name-lookup
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
     ports:
       - "443:443"
     volumes:
+      - ./config.yaml:/app/config.yaml:ro
       - ./phone_directory.csv:/app/phone_directory.csv:ro
-      - ./certs/server.crt:/app/certs/server.crt:ro
-      - ./certs/server.key:/app/certs/server.key:ro
-    environment:
-      - LOG_LEVEL=INFO
-      - GUNICORN_CMD_ARGS=--certfile=/app/certs/server.crt --keyfile=/app/certs/server.key --bind=0.0.0.0:443
+      - ./certs:/app/certs:ro
     restart: unless-stopped
 ```
+
+**Private key permissions:** The `server.key` file is created with `chmod 600` (owner-only read) for security. The container must run as the UID that owns the key file. Two approaches:
+
+1. **Match the container UID to the file owner** (recommended) — set `DOCKER_UID` and `DOCKER_GID` in a `.env` file next to `docker-compose.yml`:
+   ```
+   DOCKER_UID=1000
+   DOCKER_GID=1000
+   ```
+   Use `id -u` and `id -g` on your deployment server to find the correct values for the user that owns the cert files.
+
+2. **Change file ownership to match the default container user** — the Dockerfile creates `appuser` with uid 1000:
+   ```bash
+   sudo chown 1000:1000 certs/server.key certs/server.crt
+   ```
 
 ## UCM Configuration
 
