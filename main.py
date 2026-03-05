@@ -163,32 +163,36 @@ class ClusterConfig:
     allowed_subjects: set[str] = field(default_factory=set)
     ca_file: str | None = None
     ca_subject: tuple | None = None
+    ca_is_leaf: bool = False
 
 
-def _load_ca_subject(ca_file: str, cluster_name: str) -> tuple | None:
-    """Load a CA certificate and return its ``subject`` tuple.
+def _load_ca_subject(
+    ca_file: str, cluster_name: str
+) -> tuple[tuple | None, bool]:
+    """Load a certificate and return its ``subject`` tuple and type.
 
     The returned tuple uses the same nested-tuple format as
     :meth:`ssl.SSLSocket.getpeercert` so that it can be directly
-    compared with a client certificate's ``issuer`` field at request
-    time. This provides application-layer CA verification: after the
-    TLS handshake accepts any CA in the combined trust store, the
-    application can confirm that the client certificate was actually
-    signed by the *specific* CA assigned to the matched cluster.
+    compared with a client certificate at request time.
 
-    Returns ``None`` if the CA certificate cannot be loaded.
+    For CA certificates (``CA:TRUE``), the subject is compared against
+    the client certificate's ``issuer`` field — verifying the client
+    cert was signed by this CA.
+
+    For leaf certificates (``CA:FALSE``, e.g. a CA-signed UCM cert),
+    the subject is compared against the client certificate's
+    ``subject`` field — verifying the client is presenting the
+    expected certificate identity.
+
+    Returns ``(subject_tuple, is_leaf)`` or ``(None, False)``.
     """
+    # --- Try loading as a CA certificate first ---
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.load_verify_locations(ca_file)
         ca_certs = ctx.get_ca_certs()
         if ca_certs:
-            return ca_certs[0].get("subject")
-        logger.warning(
-            "Cluster '%s': CA file '%s' contained no certificates",
-            cluster_name,
-            ca_file,
-        )
+            return ca_certs[0].get("subject"), False
     except (ssl.SSLError, OSError) as exc:
         logger.error(
             "Cluster '%s': failed to load CA file '%s': %s",
@@ -196,7 +200,36 @@ def _load_ca_subject(ca_file: str, cluster_name: str) -> tuple | None:
             ca_file,
             exc,
         )
-    return None
+        return None, False
+
+    # --- Fallback: parse as a leaf certificate ---
+    try:
+        cert_dict = ssl._ssl._test_decode_cert(ca_file)  # noqa: SLF001
+        if cert_dict:
+            subject = cert_dict.get("subject")
+            if subject:
+                logger.info(
+                    "Cluster '%s': '%s' is a leaf certificate "
+                    "(not a CA). Client certificate identity "
+                    "will be verified by subject match.",
+                    cluster_name,
+                    ca_file,
+                )
+                return subject, True
+    except Exception as exc:
+        logger.warning(
+            "Cluster '%s': could not parse certificate '%s': %s",
+            cluster_name,
+            ca_file,
+            exc,
+        )
+
+    logger.warning(
+        "Cluster '%s': CA file '%s' contained no usable certificates",
+        cluster_name,
+        ca_file,
+    )
+    return None, False
 
 
 def _parse_network_list(
@@ -269,10 +302,13 @@ def _parse_clusters(raw_clusters: dict) -> list[ClusterConfig]:
         )
         ca_file = cfg.get("ca_file")
         ca_subject = None
+        ca_is_leaf = False
         if ca_file is not None:
             ca_file = str(ca_file)
             if os.path.isfile(ca_file):
-                ca_subject = _load_ca_subject(ca_file, str(name))
+                ca_subject, ca_is_leaf = _load_ca_subject(
+                    ca_file, str(name)
+                )
             else:
                 logger.error(
                     "Cluster '%s': CA file not found: %s", name, ca_file
@@ -286,6 +322,7 @@ def _parse_clusters(raw_clusters: dict) -> list[ClusterConfig]:
                 allowed_subjects=subjects,
                 ca_file=ca_file,
                 ca_subject=ca_subject,
+                ca_is_leaf=ca_is_leaf,
             )
         )
     return clusters
@@ -311,7 +348,15 @@ if CLUSTERS:
         if _cl.ca_file:
             _parts.append(f"CA: {_cl.ca_file}")
         if _cl.ca_subject:
-            _parts.append("app-layer CA issuer verification: enabled")
+            if _cl.ca_is_leaf:
+                _parts.append(
+                    "app-layer cert identity verification: enabled "
+                    "(leaf certificate)"
+                )
+            else:
+                _parts.append(
+                    "app-layer CA issuer verification: enabled"
+                )
         logger.info(
             "Cluster '%s' — %s",
             _cl.name,
@@ -532,23 +577,35 @@ def _enforce_cluster_access():
                 )
                 continue
 
-        # 3. CA issuer check (application-layer CA verification)
+        # 3. Certificate verification (application-layer)
+        #    - CA cert: compare client cert issuer against CA subject
+        #    - Leaf cert: compare client cert subject against leaf subject
         if cluster.ca_subject:
             if cert is None:
                 logger.debug(
-                    "Cluster '%s': CA issuer verification required "
+                    "Cluster '%s': certificate verification required "
                     "but client certificate is not accessible",
                     cluster.name,
                 )
                 continue
-            cert_issuer = cert.get("issuer")
-            if cert_issuer != cluster.ca_subject:
-                logger.debug(
-                    "Cluster '%s': cert issuer does not match "
-                    "cluster CA subject",
-                    cluster.name,
-                )
-                continue
+            if cluster.ca_is_leaf:
+                cert_subject = cert.get("subject")
+                if cert_subject != cluster.ca_subject:
+                    logger.debug(
+                        "Cluster '%s': client cert subject does not "
+                        "match expected leaf certificate identity",
+                        cluster.name,
+                    )
+                    continue
+            else:
+                cert_issuer = cert.get("issuer")
+                if cert_issuer != cluster.ca_subject:
+                    logger.debug(
+                        "Cluster '%s': cert issuer does not match "
+                        "cluster CA subject",
+                        cluster.name,
+                    )
+                    continue
 
         # All defined rules passed — request is authorized.
         logger.debug(

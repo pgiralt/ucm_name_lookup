@@ -70,9 +70,13 @@ A request must match **at least one** cluster. Matching means passing **all** of
 **Three-layer enforcement** per cluster (in `_enforce_cluster_access`):
 1. IP address check against `allowed_networks`
 2. Certificate CN/SAN check against `allowed_subjects`
-3. Certificate issuer check against `ca_subject` (app-layer CA verification)
+3. Certificate verification against `ca_subject` (app-layer)
 
-The third check is critical: in production, Gunicorn uses a single combined CA bundle (`--ca-certs`), so the TLS layer accepts certs from *any* cluster's CA. The app-layer issuer check ensures a client cert signed by cluster B's CA cannot authorize a request as cluster A.
+The third check adapts based on the certificate type in `ca_file`:
+- **CA certificate** (`CA:TRUE`, e.g. self-signed UCM cert): compares the client cert's **issuer** against the CA's subject — verifying the client cert was signed by this CA.
+- **Leaf certificate** (`CA:FALSE`, e.g. CA-signed UCM cert): compares the client cert's **subject** against the leaf cert's subject — verifying the client is presenting the expected certificate identity.
+
+This is critical in production because Gunicorn uses a single combined CA bundle (`--ca-certs`), so the TLS layer accepts certs from *any* cluster's trust anchor. The app-layer check ensures a client cert from cluster B cannot authorize a request as cluster A.
 
 ### CA bundle auto-generation
 

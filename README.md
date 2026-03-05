@@ -241,11 +241,14 @@ services:
 
 No `GUNICORN_CMD_ARGS` needed — `gunicorn.conf.py` reads `config.yaml` and auto-configures everything.
 
-### Application-Layer CA Verification
+### Application-Layer Certificate Verification
 
-Because the TLS layer accepts any client certificate signed by *any* CA in the combined bundle, the application adds a **per-cluster CA issuer check** at request time. When a cluster defines `ca_file`, the application loads that CA's subject at startup and compares it with the `issuer` field of each incoming client certificate. A request only matches a cluster if the client cert was actually signed by **that cluster's specific CA** — not just any CA in the bundle.
+Because the TLS layer accepts any client certificate signed by *any* CA in the combined bundle, the application adds a **per-cluster certificate check** at request time. The behavior adapts automatically based on the type of certificate in `ca_file`:
 
-This happens automatically whenever `ca_file` is set for a cluster. No additional configuration is needed.
+- **CA certificate** (`CA:TRUE`, e.g. default self-signed UCM cert): the application compares the client certificate's **issuer** against the CA's subject — verifying the client cert was signed by this specific CA.
+- **Leaf certificate** (`CA:FALSE`, e.g. CA-signed UCM cert from a public or enterprise CA): the application compares the client certificate's **subject** against the leaf cert's subject — verifying the client is presenting the expected certificate identity.
+
+This happens automatically whenever `ca_file` is set for a cluster. No additional configuration is needed. The application detects the certificate type at startup and logs which verification mode is active.
 
 ### Certificate Subject Validation (CN/SAN)
 
