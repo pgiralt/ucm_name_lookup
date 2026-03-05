@@ -37,13 +37,35 @@ Environment Variables:
     FLASK_PORT      - Port to bind to in dev mode (default: 5000)
     TLS_CERT_FILE   - Path to TLS certificate file (optional, dev HTTPS)
     TLS_KEY_FILE    - Path to TLS private key file (optional, dev HTTPS)
+    TLS_CA_FILE     - Path to CA / client certificate for mutual TLS
+                      (optional).  When set, the server requires
+                      connecting clients (UCM) to present a certificate
+                      signed by this CA.  For production with Gunicorn,
+                      use --ca-certs and --cert-reqs=2 instead.
+    ALLOWED_IPS     - Comma-separated list of IP addresses allowed to
+                      reach the /curri endpoint (optional).  When set,
+                      requests from other IPs receive HTTP 403.  Supports
+                      individual addresses and CIDR notation, e.g.
+                      "10.1.1.10,10.1.1.11,10.1.2.0/24".
+    TLS_ALLOWED_SUBJECTS
+                    - Comma-separated list of expected Common Name (CN)
+                      and/or Subject Alternative Name (SAN) values for
+                      client certificates (optional).  When set, the
+                      application validates that the connecting client's
+                      certificate contains at least one CN or SAN that
+                      matches an entry in this list.  This prevents
+                      any host with a certificate signed by the same CA
+                      from accessing the service.  Example:
+                      "cucm-pub.example.com,cucm-sub1.example.com"
     LOG_LEVEL       - Logging level: DEBUG, INFO, WARNING, ERROR
                       (default: INFO)
 """
 
 import csv
+import ipaddress
 import logging
 import os
+import ssl
 import sys
 from xml.sax.saxutils import escape as xml_escape
 
@@ -65,6 +87,28 @@ FLASK_PORT = int(os.environ.get("FLASK_PORT", "5000"))
 # For production, configure TLS through Gunicorn's --certfile / --keyfile.
 TLS_CERT_FILE = os.environ.get("TLS_CERT_FILE")
 TLS_KEY_FILE = os.environ.get("TLS_KEY_FILE")
+
+# Optional CA certificate for mutual TLS (mTLS) client verification.
+# When set, the server requires connecting clients to present a valid
+# certificate signed by this CA.  For UCM, this should be the exported
+# CallManager.pem certificate.
+# For production with Gunicorn, use --ca-certs and --cert-reqs=2 instead.
+TLS_CA_FILE = os.environ.get("TLS_CA_FILE")
+
+# Optional comma-separated list of IP addresses (or CIDR networks)
+# allowed to reach the /curri endpoint.  When set, requests from
+# unlisted IPs receive HTTP 403.  Useful as defense-in-depth to
+# restrict access to known UCM cluster nodes.
+ALLOWED_IPS_RAW = os.environ.get("ALLOWED_IPS", "").strip()
+
+# Optional comma-separated list of expected CN / SAN values that the
+# client certificate must contain.  When set, after the TLS handshake
+# verifies the certificate chain, the application additionally checks
+# that the peer certificate's Common Name or Subject Alternative Name
+# matches at least one entry in this list.  This is critical when the
+# CA is a well-known public CA — without this check, *any* certificate
+# signed by the same CA would be accepted.
+TLS_ALLOWED_SUBJECTS_RAW = os.environ.get("TLS_ALLOWED_SUBJECTS", "").strip()
 
 # Logging verbosity level.
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -90,10 +134,252 @@ logging.basicConfig(
 logger = logging.getLogger("ucm_name_lookup")
 
 # ---------------------------------------------------------------------------
+# IP Allow-List
+# ---------------------------------------------------------------------------
+
+def _parse_allowed_networks(
+    raw: str,
+) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """Parse the ALLOWED_IPS environment variable into a list of networks.
+
+    Accepts individual IP addresses (``10.1.1.10``) and CIDR notation
+    (``10.1.2.0/24``).  Individual addresses are converted to /32 (IPv4)
+    or /128 (IPv6) host networks.
+
+    Returns an empty list when the input is blank, meaning IP filtering
+    is disabled.
+    """
+    if not raw:
+        return []
+    networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            logger.error(
+                "Invalid entry in ALLOWED_IPS, skipping: '%s'", entry
+            )
+    return networks
+
+
+ALLOWED_NETWORKS = _parse_allowed_networks(ALLOWED_IPS_RAW)
+
+if ALLOWED_NETWORKS:
+    logger.info(
+        "IP allow-list enabled — %d network(s): %s",
+        len(ALLOWED_NETWORKS),
+        ", ".join(str(n) for n in ALLOWED_NETWORKS),
+    )
+else:
+    logger.info("IP allow-list is not configured (ALLOWED_IPS is empty)")
+
+# ---------------------------------------------------------------------------
+# Client Certificate Subject Allow-List
+# ---------------------------------------------------------------------------
+
+def _parse_allowed_subjects(raw: str) -> set[str]:
+    """Parse the TLS_ALLOWED_SUBJECTS environment variable.
+
+    Returns a set of lower-cased CN / SAN values that the client
+    certificate must match.  An empty set means subject validation is
+    disabled.
+    """
+    if not raw:
+        return set()
+    subjects: set[str] = set()
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if entry:
+            subjects.add(entry.lower())
+    return subjects
+
+
+ALLOWED_SUBJECTS = _parse_allowed_subjects(TLS_ALLOWED_SUBJECTS_RAW)
+
+if ALLOWED_SUBJECTS:
+    logger.info(
+        "Client certificate subject validation enabled — %d subject(s): %s",
+        len(ALLOWED_SUBJECTS),
+        ", ".join(sorted(ALLOWED_SUBJECTS)),
+    )
+else:
+    logger.info(
+        "Client certificate subject validation is not configured "
+        "(TLS_ALLOWED_SUBJECTS is empty)"
+    )
+
+
+# ===========================================================================
+# Client Certificate Helpers
+# ===========================================================================
+
+def _get_peer_certificate() -> dict | None:
+    """Extract the peer (client) certificate from the current request.
+
+    Works with both Gunicorn (via ``gunicorn.socket``) and the Werkzeug
+    development server (via ``werkzeug.request``).
+
+    Returns:
+        The parsed certificate dictionary from
+        :meth:`ssl.SSLSocket.getpeercert`, or ``None`` if the peer
+        certificate is not accessible.
+    """
+    # --- Gunicorn: exposes the raw socket in the WSGI environ ---
+    sock = request.environ.get("gunicorn.socket")
+    if sock is not None and hasattr(sock, "getpeercert"):
+        cert = sock.getpeercert()
+        if cert:
+            return cert
+
+    # --- Werkzeug dev server: handler stored in environ ---
+    handler = request.environ.get("werkzeug.request")
+    if handler is not None:
+        conn = getattr(handler, "connection", None)
+        if conn is not None and hasattr(conn, "getpeercert"):
+            cert = conn.getpeercert()
+            if cert:
+                return cert
+
+    return None
+
+
+def _get_cert_subjects(cert: dict) -> set[str]:
+    """Extract CN and SAN values from a parsed peer certificate.
+
+    Collects:
+        - Common Name (CN) from the ``subject`` field.
+        - DNS names and IP addresses from ``subjectAltName``.
+
+    All values are lower-cased for case-insensitive comparison.
+
+    Args:
+        cert: Certificate dictionary as returned by
+              :meth:`ssl.SSLSocket.getpeercert`.
+
+    Returns:
+        A set of lower-cased subject identifiers found in the
+        certificate.
+    """
+    subjects: set[str] = set()
+
+    # Extract CN from subject RDN sequence.
+    for rdn in cert.get("subject", ()):
+        for attr_type, attr_value in rdn:
+            if attr_type == "commonName":
+                subjects.add(attr_value.lower())
+
+    # Extract DNS names and IP addresses from SAN.
+    for san_type, san_value in cert.get("subjectAltName", ()):
+        if san_type in ("DNS", "IP Address"):
+            subjects.add(san_value.lower())
+
+    return subjects
+
+
+# ---------------------------------------------------------------------------
 # Flask Application
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
+
+
+@app.before_request
+def _enforce_ip_allowlist():
+    """Reject requests from IPs not in the allow-list (when configured).
+
+    This applies to the ``/curri`` endpoint only — the ``/health``
+    endpoint remains open so that load-balancer and Docker health
+    checks continue to work from any source.
+
+    Returns ``403 Forbidden`` for denied requests.
+    """
+    if not ALLOWED_NETWORKS:
+        return None
+
+    if request.path == "/health":
+        return None
+
+    client_ip_str = request.remote_addr
+    try:
+        client_ip = ipaddress.ip_address(client_ip_str)
+    except ValueError:
+        logger.warning(
+            "Could not parse client IP '%s' — denying request",
+            client_ip_str,
+        )
+        return Response("Forbidden\n", status=403, mimetype="text/plain")
+
+    for network in ALLOWED_NETWORKS:
+        if client_ip in network:
+            return None
+
+    logger.warning(
+        "Denied request from %s to %s (not in ALLOWED_IPS)",
+        client_ip_str,
+        request.path,
+    )
+    return Response("Forbidden\n", status=403, mimetype="text/plain")
+
+
+@app.before_request
+def _enforce_client_cert_subject():
+    """Reject requests whose client certificate CN/SAN is not in the allow-list.
+
+    When ``TLS_ALLOWED_SUBJECTS`` is configured, this hook extracts the
+    peer certificate from the TLS connection and checks that at least one
+    of its Common Name (CN) or Subject Alternative Name (SAN) values
+    matches an entry in the allow-list.
+
+    This prevents hosts that happen to hold a certificate signed by the
+    same CA — but are not authorized UCM servers — from reaching the
+    ``/curri`` endpoint.
+
+    The ``/health`` endpoint is exempt so that health checks continue
+    to work regardless of certificate subject.
+
+    Returns ``403 Forbidden`` if the certificate subject does not match.
+    """
+    if not ALLOWED_SUBJECTS:
+        return None
+
+    if request.path == "/health":
+        return None
+
+    cert = _get_peer_certificate()
+    if cert is None:
+        # The peer certificate could not be read from the WSGI environ.
+        # This can happen when TLS is terminated by a reverse proxy or
+        # when running in plain HTTP mode.  Fail closed: deny the
+        # request because subject validation was explicitly requested.
+        logger.warning(
+            "TLS_ALLOWED_SUBJECTS is configured but the client "
+            "certificate is not accessible — denying request to %s.  "
+            "Ensure mTLS is enabled and the server exposes the peer "
+            "certificate (Gunicorn or Flask dev server with TLS_CA_FILE).",
+            request.path,
+        )
+        return Response("Forbidden\n", status=403, mimetype="text/plain")
+
+    cert_subjects = _get_cert_subjects(cert)
+    if cert_subjects & ALLOWED_SUBJECTS:
+        logger.debug(
+            "Client certificate subject OK: %s",
+            cert_subjects & ALLOWED_SUBJECTS,
+        )
+        return None
+
+    logger.warning(
+        "Denied request to %s — client certificate subjects %s "
+        "do not match TLS_ALLOWED_SUBJECTS %s",
+        request.path,
+        sorted(cert_subjects),
+        sorted(ALLOWED_SUBJECTS),
+    )
+    return Response("Forbidden\n", status=403, mimetype="text/plain")
+
 
 # In-memory phone directory loaded from CSV at startup.
 # exact_directory: keys are normalized phone numbers (digits only), values are display names.
@@ -672,10 +958,37 @@ if __name__ == "__main__":
     ssl_context = None
     if TLS_CERT_FILE and TLS_KEY_FILE:
         if os.path.isfile(TLS_CERT_FILE) and os.path.isfile(TLS_KEY_FILE):
-            ssl_context = (TLS_CERT_FILE, TLS_KEY_FILE)
+            # Build an SSLContext so we can optionally enable mTLS.
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+            ssl_context.load_cert_chain(TLS_CERT_FILE, TLS_KEY_FILE)
             logger.info(
                 "TLS enabled with cert=%s key=%s", TLS_CERT_FILE, TLS_KEY_FILE
             )
+
+            # --- Mutual TLS (mTLS) ---
+            # When TLS_CA_FILE is set, require connecting clients to
+            # present a certificate signed by the specified CA.  For UCM
+            # this should be the exported CallManager.pem certificate.
+            if TLS_CA_FILE:
+                if os.path.isfile(TLS_CA_FILE):
+                    ssl_context.load_verify_locations(TLS_CA_FILE)
+                    ssl_context.verify_mode = ssl.CERT_REQUIRED
+                    logger.info(
+                        "Mutual TLS enabled — clients must present a "
+                        "certificate signed by CA: %s",
+                        TLS_CA_FILE,
+                    )
+                else:
+                    logger.error(
+                        "TLS CA file not found: %s", TLS_CA_FILE
+                    )
+                    sys.exit(1)
+            else:
+                logger.info(
+                    "Mutual TLS is not configured (TLS_CA_FILE not set). "
+                    "Client certificates will not be verified."
+                )
         else:
             logger.error(
                 "TLS certificate or key file not found: cert=%s, key=%s",

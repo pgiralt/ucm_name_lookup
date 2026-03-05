@@ -19,6 +19,21 @@
 #       -v /path/to/server.key:/app/certs/server.key:ro \
 #       -e GUNICORN_CMD_ARGS="--certfile=/app/certs/server.crt --keyfile=/app/certs/server.key --bind=0.0.0.0:443" \
 #       ucm-name-lookup
+#
+# Run (HTTPS + mTLS – also mount the UCM CA certificate):
+#   docker run -p 443:443 \
+#       -v /path/to/phone_directory.csv:/app/phone_directory.csv:ro \
+#       -v /path/to/server.crt:/app/certs/server.crt:ro \
+#       -v /path/to/server.key:/app/certs/server.key:ro \
+#       -v /path/to/CallManager.pem:/app/certs/ca.pem:ro \
+#       -e GUNICORN_CMD_ARGS="--certfile=/app/certs/server.crt --keyfile=/app/certs/server.key --ca-certs=/app/certs/ca.pem --cert-reqs=2 --bind=0.0.0.0:443" \
+#       ucm-name-lookup
+#
+# Run (with IP allow-list – restrict to specific UCM cluster nodes):
+#   docker run -p 80:80 \
+#       -v /path/to/phone_directory.csv:/app/phone_directory.csv:ro \
+#       -e ALLOWED_IPS="10.1.1.10,10.1.1.11,10.1.2.0/24" \
+#       ucm-name-lookup
 # ---------------------------------------------------------------------------
 
 # ---- Stage 1: Build dependencies ----
