@@ -258,7 +258,7 @@ When configured, the application extracts the CN and SAN fields from the connect
 
 - Comparison is **case-insensitive**
 - Both DNS SANs and IP Address SANs are checked
-- The `/health` endpoint is **exempt**
+- The `/health` endpoint is **restricted to localhost** when clusters are defined
 - If the peer certificate is not accessible (e.g. TLS terminated by a reverse proxy without forwarding cert info), the request is **denied** (fail-closed)
 
 ### IP Allow-List (Defense-in-Depth)
@@ -266,7 +266,7 @@ When configured, the application extracts the CN and SAN fields from the connect
 The `allowed_ips` list in each cluster definition restricts which IP addresses are permitted to reach the `/curri` endpoint. This is especially useful when mTLS is not feasible or as a supplementary control.
 
 - Accepts individual IPs and CIDR notation
-- The `/health` endpoint is **exempt** so load-balancer and Docker health checks continue to work
+- The `/health` endpoint is **restricted to localhost** (127.0.0.1 / ::1) when clusters are defined, so only the in-container Docker health check can reach it
 - When no clusters define `allowed_ips`, all IPs are allowed (no filtering)
 
 > **Recommendation:** For maximum security, define **all three** controls in each cluster:
@@ -360,7 +360,7 @@ docker run -p 443:443 \
     ucm-name-lookup
 ```
 
-The container runs Gunicorn with 4 gthread workers (4 threads each, 16 total). The worker temporary directory is set to `/dev/shm` (shared memory) to prevent false worker timeouts caused by slow I/O on Docker's overlay filesystem. Override Gunicorn settings at runtime via the `GUNICORN_CMD_ARGS` environment variable. A built-in Docker `HEALTHCHECK` polls `/health` every 30 seconds.
+The container runs Gunicorn with 4 gthread workers (4 threads each, 16 total). The worker temporary directory is set to `/dev/shm` (shared memory) to prevent false worker timeouts caused by slow I/O on Docker's overlay filesystem. Override Gunicorn settings at runtime via the `GUNICORN_CMD_ARGS` environment variable. A built-in Docker `HEALTHCHECK` runs every 30 seconds — it probes `/health` over HTTP(S) when mTLS is not active, or verifies Gunicorn worker processes are alive via `/proc` when mTLS is enabled (since `CERT_REQUIRED` prevents connections without a client certificate).
 
 ### Docker Compose
 
@@ -447,7 +447,7 @@ services:
 |---|---|---|
 | `POST` | `/curri` | CURRI XACML endpoint for UCM ECC requests |
 | `HEAD` | `/curri` | Keepalive probe — returns `200 OK` (used by UCM to check service availability) |
-| `GET` | `/health` | Health check — returns JSON with service status and directory entry count |
+| `GET` | `/health` | Health check — returns JSON with service status and directory entry count. **Localhost only** when clusters are defined |
 
 ## Testing with curl
 

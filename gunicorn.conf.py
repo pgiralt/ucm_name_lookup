@@ -83,6 +83,9 @@ if os.path.isfile(_cert) and os.path.isfile(_key):
     bind = "0.0.0.0:443"
 
     # Enable mTLS if the CA bundle is available.
+    # CERT_REQUIRED means all TLS connections must present a valid
+    # client certificate. The Docker health check uses a process-level
+    # check instead of HTTPS when mTLS is active.
     if _bundle_path and os.path.isfile(_bundle_path):
         ca_certs = _bundle_path
         cert_reqs = ssl.CERT_REQUIRED

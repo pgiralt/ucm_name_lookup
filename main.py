@@ -512,8 +512,10 @@ def _enforce_cluster_access():
         2. If the cluster specifies ``allowed_subjects``, the client
            certificate must contain at least one matching CN or SAN.
 
-    The ``/health`` endpoint is always exempt so that load-balancer and
-    Docker health checks continue to work from any source.
+    The ``/health`` endpoint is restricted to localhost (``127.0.0.1``
+    and ``::1``) so that only the Docker health check and local probes
+    can reach it. This allows mTLS (``CERT_REQUIRED``) to remain
+    strict for all external connections.
 
     When no clusters are configured, access is unrestricted.
 
@@ -523,7 +525,13 @@ def _enforce_cluster_access():
         return None
 
     if request.path == "/health":
-        return None
+        if request.remote_addr in ("127.0.0.1", "::1"):
+            return None
+        logger.warning(
+            "Denied /health request from non-local IP %s",
+            request.remote_addr,
+        )
+        return Response("Forbidden\n", status=403, mimetype="text/plain")
 
     # --- Parse client IP ---
     client_ip_str = request.remote_addr
@@ -1243,8 +1251,8 @@ if __name__ == "__main__":
             if ca_loaded:
                 ssl_context.verify_mode = ssl.CERT_REQUIRED
                 logger.info(
-                    "Mutual TLS enabled — clients must present a "
-                    "certificate signed by a configured cluster CA"
+                    "Mutual TLS enabled — client certificates are "
+                    "required for all connections"
                 )
             else:
                 logger.info(

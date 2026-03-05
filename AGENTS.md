@@ -115,7 +115,7 @@ Numbers are normalized (strip formatting chars, preserve leading `+`) before loo
 ## Important Conventions
 
 - **Never reject calls** — always return Permit/Continue, even on errors or empty input
-- **`/health` is always exempt** from IP/cert enforcement (for load balancer probes)
+- **`/health` is localhost-only** when clusters are defined (127.0.0.1 / ::1); unrestricted when no clusters are configured. The Docker health check uses a process-level check (scanning `/proc` for gunicorn workers) when mTLS is active, since `CERT_REQUIRED` prevents HTTP connections without a client cert
 - **`defusedxml` for all XML parsing** — prevents XXE attacks
 - **`yaml.safe_load` only** — prevents unsafe deserialization
 - **No secrets in config.yaml** — TLS keys go through Gunicorn CLI or file mounts
