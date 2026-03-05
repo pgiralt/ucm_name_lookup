@@ -177,9 +177,10 @@ def load_phone_directory(
     those digits will match.  Exact matches are always evaluated before
     prefix matches, and the *longest* matching prefix wins.
 
-    Phone numbers are normalized by stripping whitespace, leading '+' signs,
-    dashes, parentheses, and dots so that lookup matching is resilient to
-    formatting differences between the CSV and UCM's calling party numbers.
+    Phone numbers are normalized by stripping whitespace, dashes,
+    parentheses, and dots while preserving a leading ``+`` for E.164
+    compatibility, so that lookup matching is resilient to formatting
+    differences between the CSV and UCM's calling party numbers.
 
     Important:
         Phone numbers in the CSV should include the country code if UCM
@@ -287,25 +288,26 @@ def load_phone_directory(
 
 
 def normalize_phone_number(phone: str) -> str:
-    """Normalize a phone number to digits only for consistent matching.
+    """Normalize a phone number for consistent matching.
 
-    Strips whitespace and removes common formatting characters: ``+``,
-    ``-``, ``(``, ``)``, ``.``, and spaces.  The result contains only
-    digit characters.
+    Strips whitespace and removes common formatting characters:
+    ``-``, ``(``, ``)``, ``.``, and spaces.  A leading ``+`` is
+    preserved because it is a valid component of E.164 numbers.
 
     Examples::
 
-        "+1 (212) 555-1212"  ->  "12125551212"
+        "+1 (212) 555-1212"  ->  "+12125551212"
         "12125551212"        ->  "12125551212"
-        "+12125551212"       ->  "12125551212"
+        "+12125551212"       ->  "+12125551212"
 
     Args:
         phone: The raw phone number string.
 
     Returns:
-        A normalized string containing only digits.
+        A normalized string containing only digits and an optional
+        leading ``+``.
     """
-    for ch in ("+", "-", "(", ")", ".", " "):
+    for ch in ("-", "(", ")", ".", " "):
         phone = phone.replace(ch, "")
     return phone.strip()
 

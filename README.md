@@ -67,7 +67,7 @@ phone_number,display_name,match_type
 
 The `match_type` column is optional. If it is omitted entirely, every row is treated as an exact match, preserving backward compatibility with existing CSV files.
 
-**Important**: Phone numbers are normalized to digits only (stripping `+`, `-`, `()`, `.`, spaces) for matching. Ensure your CSV numbers include the country code if UCM sends numbers in E.164 format (e.g., `+12125551212`).
+**Important**: Phone numbers are normalized by stripping formatting characters (`-`, `()`, `.`, spaces) while preserving a leading `+` for E.164 compatibility. Ensure your CSV numbers include the country code if UCM sends numbers in E.164 format (e.g., `+12125551212`).
 
 ## Running
 
