@@ -372,7 +372,7 @@ services:
     build: .
     container_name: ucm-name-lookup
     ports:
-      - "5015:80"
+      - "80:80"
     volumes:
       - ./phone_directory.csv:/app/phone_directory.csv:ro
     environment:
@@ -397,7 +397,7 @@ docker compose build --no-cache
 docker compose up -d
 ```
 
-By default the compose file maps host port **5015** to the container's port 80. To change the host port, edit the `ports` mapping (e.g., `"80:80"` to listen on port 80).
+The example above maps host port 80 to the container's port 80 (HTTP). When TLS is enabled, use `443:443` instead — see the HTTPS example below.
 
 To enable HTTPS via Docker Compose, mount the `certs/` directory. `gunicorn.conf.py` auto-detects the cert/key and switches to HTTPS on port 443:
 

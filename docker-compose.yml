@@ -7,7 +7,10 @@ services:
     # Override via .env or environment: DOCKER_UID=<uid> DOCKER_GID=<gid>
     user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
     ports:
-      - "5015:80"
+      # HTTPS (TLS auto-detected by gunicorn.conf.py when certs are present)
+      - "443:443"
+      # Uncomment the line below instead if running without TLS (HTTP on port 80):
+      # - "80:80"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./phone_directory.csv:/app/phone_directory.csv:ro
