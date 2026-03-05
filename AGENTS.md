@@ -74,13 +74,24 @@ A request must match **at least one** cluster. Matching means passing **all** of
 
 The third check adapts based on the certificate type in `ca_file`:
 - **CA certificate** (`CA:TRUE`, e.g. self-signed UCM cert): compares the client cert's **issuer** against the CA's subject — verifying the client cert was signed by this CA.
-- **Leaf certificate** (`CA:FALSE`, e.g. CA-signed UCM cert): compares the client cert's **subject** against the leaf cert's subject — verifying the client is presenting the expected certificate identity.
+- **Leaf certificate** (`CA:FALSE`, e.g. CA-signed UCM cert): uses **SHA-256 fingerprint pinning** — computes the hash of the client cert's DER encoding and compares it against the pre-computed hash of the stored cert using constant-time comparison (`hmac.compare_digest`). This proves the *exact same certificate* was presented, not merely one with the same subject name. An attacker cannot bypass this by forging a certificate with matching subject fields.
+
+Under `CERT_OPTIONAL` (leaf-only bundle), `getpeercert()` returns an empty dict because chain verification fails. The code uses `getpeercert(binary_form=True)` to get the raw DER bytes regardless, then decodes them via `_decode_der_cert()` for subject/SAN extraction.
 
 This is critical in production because Gunicorn uses a single combined CA bundle (`--ca-certs`), so the TLS layer accepts certs from *any* cluster's trust anchor. The app-layer check ensures a client cert from cluster B cannot authorize a request as cluster A.
 
 ### CA bundle auto-generation
 
 When `ca_bundle_path` is set in config, the app concatenates all unique cluster `ca_file` entries into a single PEM bundle at startup. This file is what Gunicorn's `--ca-certs` should point to.
+
+### CERT_REQUIRED vs CERT_OPTIONAL auto-detection
+
+At startup, both `gunicorn.conf.py` and the dev server probe the CA bundle to determine whether it contains real CA certificates (`CA:TRUE`) or only leaf certificates (`CA:FALSE`):
+
+- **Real CA certs present → `CERT_REQUIRED`**: the TLS layer enforces client certificate verification. The Docker health check uses a process-level check since HTTP connections without a client cert are rejected.
+- **Leaf-only bundle → `CERT_OPTIONAL`**: the TLS handshake completes without requiring a valid chain. The **application layer** handles identity verification via subject matching in `_enforce_cluster_access`. The Docker health check uses the HTTP `/health` endpoint normally.
+
+This auto-detection is necessary because OpenSSL cannot use a leaf certificate as a trust anchor — `CERT_REQUIRED` with a leaf-only bundle causes all client connections to fail with `unable to get local issuer certificate`.
 
 ### Phone number matching
 

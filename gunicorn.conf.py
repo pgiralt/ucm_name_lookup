@@ -87,12 +87,31 @@ if os.path.isfile(_cert) and os.path.isfile(_key):
     bind = "0.0.0.0:443"
 
     # Enable mTLS if the CA bundle is available.
-    # CERT_REQUIRED means all TLS connections must present a valid
-    # client certificate. The Docker health check uses a process-level
-    # check instead of HTTPS when mTLS is active.
+    # When the bundle contains real CA certificates, use CERT_REQUIRED
+    # so that the TLS layer enforces client certificate verification.
+    # When the bundle contains only leaf certificates (e.g. a UCM
+    # CallManager.pem that is not a CA), use CERT_OPTIONAL so the TLS
+    # handshake can complete — the application layer then handles
+    # certificate identity verification via subject matching.
     if _bundle_path and os.path.isfile(_bundle_path):
         ca_certs = _bundle_path
-        cert_reqs = ssl.CERT_REQUIRED
+        # Check if the bundle has any real CA certs.
+        _has_ca_certs = False
+        try:
+            _probe_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            _probe_ctx.load_verify_locations(_bundle_path)
+            _has_ca_certs = bool(_probe_ctx.get_ca_certs())
+        except (ssl.SSLError, OSError):
+            pass
+        if _has_ca_certs:
+            cert_reqs = ssl.CERT_REQUIRED
+        else:
+            cert_reqs = ssl.CERT_OPTIONAL
+            print(
+                "[INFO] CA bundle contains only leaf certificates — "
+                "using CERT_OPTIONAL. Client certificate verification "
+                "will be handled at the application layer."
+            )
 
     # --- TLS debug diagnostics (only when LOG_LEVEL=DEBUG) ---
     if _log_level == "DEBUG":
@@ -100,10 +119,12 @@ if os.path.isfile(_cert) and os.path.isfile(_key):
         print(f"  certfile  = {_cert}")
         print(f"  keyfile   = {_key}")
         print(f"  ca_certs  = {_bundle_path or '<none>'}")
-        print(
-            f"  cert_reqs = "
-            f"{'CERT_REQUIRED' if _bundle_path and os.path.isfile(_bundle_path) else 'none (no mTLS)'}"
-        )
+        _cr_label = "none (no mTLS)"
+        if _bundle_path and os.path.isfile(_bundle_path):
+            _cr_label = (
+                "CERT_REQUIRED" if _has_ca_certs else "CERT_OPTIONAL (leaf-only bundle)"
+            )
+        print(f"  cert_reqs = {_cr_label}")
         if _bundle_path and os.path.isfile(_bundle_path):
             try:
                 _dbg_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
