@@ -60,7 +60,7 @@ phone_number,display_name,match_type
 +1415,San Francisco,prefix
 ```
 
-**Matching behaviour:**
+**Matching behavior:**
 - **`exact`** (default when column is absent) — the incoming calling number must match the full normalized phone number.
 - **`prefix`** — any incoming number whose digits *start with* the normalized prefix will match.
 - Exact matches are always evaluated first. Prefix matching is only attempted when no exact match is found, and the **longest** matching prefix wins.

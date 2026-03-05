@@ -167,7 +167,7 @@ def load_phone_directory(
         - ``phone_number``  : The phone number (e.g. "+12125551212")
         - ``display_name``  : The name to display (e.g. "John Doe")
 
-    An optional third column controls the matching behaviour:
+    An optional third column controls the matching behavior:
         - ``match_type``    : ``exact`` (default) or ``prefix``
 
     When ``match_type`` is ``exact`` (or the column is absent), the
