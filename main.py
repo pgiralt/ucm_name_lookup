@@ -383,9 +383,11 @@ if CLUSTERS:
             "; ".join(_parts) if _parts else "no restrictions",
         )
 else:
-    logger.info(
+    logger.warning(
         "No clusters defined — IP filtering and certificate "
-        "subject validation are disabled"
+        "subject validation are DISABLED. All clients can reach "
+        "the /curri endpoint. Define clusters in %s to restrict access.",
+        CONFIG_FILE,
     )
 
 
@@ -657,9 +659,7 @@ def _enforce_cluster_access():
 
     Returns ``403 Forbidden`` if the request does not match any cluster.
     """
-    if not CLUSTERS:
-        return None
-
+    # Always restrict /health to localhost, regardless of cluster config.
     if request.path == "/health":
         if request.remote_addr in ("127.0.0.1", "::1"):
             return None
@@ -668,6 +668,9 @@ def _enforce_cluster_access():
             request.remote_addr,
         )
         return Response("Forbidden\n", status=403, mimetype="text/plain")
+
+    if not CLUSTERS:
+        return None
 
     # --- Parse client IP ---
     client_ip_str = request.remote_addr
