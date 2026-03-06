@@ -245,7 +245,7 @@ def _validate_ca_cert(
                 ca_file,
             )
             sys.exit(1)
-    except Exception as exc:
+    except (AttributeError, TypeError, ValueError, OSError) as exc:
         logger.warning(
             "Cluster '%s': could not parse certificate '%s': %s",
             cluster_name,
@@ -333,7 +333,14 @@ def _parse_clusters(raw_clusters: dict) -> list[ClusterConfig]:
         if ca_file is not None:
             ca_file = str(ca_file)
             if os.path.isfile(ca_file):
-                _validate_ca_cert(ca_file, str(name))
+                if not _validate_ca_cert(ca_file, str(name)):
+                    logger.error(
+                        "Cluster '%s': CA file '%s' is not a valid CA "
+                        "certificate — aborting startup",
+                        name,
+                        ca_file,
+                    )
+                    sys.exit(1)
             else:
                 logger.error(
                     "Cluster '%s': CA file not found: %s", name, ca_file
