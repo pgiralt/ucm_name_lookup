@@ -19,6 +19,30 @@ import ssl
 import yaml
 
 # ---------------------------------------------------------------------------
+# Enforce TLS 1.3 minimum protocol version
+# ---------------------------------------------------------------------------
+# Gunicorn does not expose SSLContext.minimum_version in its configuration.
+# Subclass SSLContext and replace the module attribute so that every context
+# created in this process enforces TLS 1.3 as the floor. This affects the
+# server TLS listener that Gunicorn creates internally via ssl_wrap_socket().
+#
+# Note: UCM must support TLS 1.3 for mTLS connections to succeed. If your
+# UCM cluster only supports TLS 1.2, change TLSv1_3 to TLSv1_2 below.
+
+_OrigSSLContext = ssl.SSLContext
+
+
+class _TLS13SSLContext(_OrigSSLContext):
+    """SSLContext subclass that enforces TLS 1.3 minimum."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.minimum_version = ssl.TLSVersion.TLSv1_3
+
+
+ssl.SSLContext = _TLS13SSLContext
+
+# ---------------------------------------------------------------------------
 # Base Gunicorn settings
 # ---------------------------------------------------------------------------
 
@@ -138,59 +162,6 @@ if os.path.isfile(_cert) and os.path.isfile(_key):
                         f"       Valid  : "
                         f"{_ca.get('notBefore', '?')} → "
                         f"{_ca.get('notAfter', '?')}"
-                    )
-                # Also check for leaf certs in the bundle
-                import re as _re
-                with open(_bundle_path, "r", encoding="utf-8") as _bf:
-                    _pem = _bf.read()
-                _blocks = _re.findall(
-                    r"(-----BEGIN CERTIFICATE-----"
-                    r".*?"
-                    r"-----END CERTIFICATE-----)",
-                    _pem,
-                    _re.DOTALL,
-                )
-                import tempfile as _tf
-                _leaf_n = 0
-                for _blk in _blocks:
-                    with _tf.NamedTemporaryFile(
-                        mode="w", suffix=".pem", delete=True
-                    ) as _tmp:
-                        _tmp.write(_blk)
-                        _tmp.flush()
-                        try:
-                            _cd = ssl._ssl._test_decode_cert(
-                                _tmp.name
-                            )
-                            _tc = ssl.SSLContext(
-                                ssl.PROTOCOL_TLS_CLIENT
-                            )
-                            _tc.load_verify_locations(_tmp.name)
-                            if _cd and not _tc.get_ca_certs():
-                                _leaf_n += 1
-                                _sp = []
-                                for _r in _cd.get("subject", ()):
-                                    for _a, _v in _r:
-                                        _sp.append(f"{_a}={_v}")
-                                _ip = []
-                                for _r in _cd.get("issuer", ()):
-                                    for _a, _v in _r:
-                                        _ip.append(f"{_a}={_v}")
-                                print(
-                                    f"  [leaf-{_leaf_n}] Subject: "
-                                    f"{', '.join(_sp)}"
-                                )
-                                print(
-                                    f"              Issuer : "
-                                    f"{', '.join(_ip)}"
-                                )
-                        except Exception:
-                            pass
-                if _leaf_n:
-                    print(
-                        f"[DEBUG] Bundle also contains "
-                        f"{_leaf_n} leaf certificate(s) "
-                        f"(not CA — used for identity matching)"
                     )
             except Exception as _exc:
                 print(

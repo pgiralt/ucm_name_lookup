@@ -6,6 +6,12 @@ services:
     # (chmod 600) is readable. Defaults to 1000 (Dockerfile's appuser).
     # Override via .env or environment: DOCKER_UID=<uid> DOCKER_GID=<gid>
     user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /dev/shm
     ports:
       # HTTPS (TLS auto-detected by gunicorn.conf.py when certs are present)
       - "443:443"

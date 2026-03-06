@@ -49,10 +49,8 @@ import csv
 import ipaddress
 import logging
 import os
-import re
 import ssl
 import sys
-import tempfile
 from dataclasses import dataclass, field
 from xml.sax.saxutils import escape as xml_escape
 
@@ -180,6 +178,14 @@ def _validate_ca_cert(
     Returns ``True`` if the CA cert is valid, ``False`` otherwise.
     The TLS layer (Gunicorn with ``CERT_REQUIRED``) handles full
     chain validation at connection time.
+
+    .. note::
+
+        Leaf-certificate detection uses the private CPython API
+        ``ssl._ssl._test_decode_cert``. There is no public Python
+        API to decode a PEM certificate without loading it into a
+        trust store. If this internal changes in a future CPython
+        release the leaf-detection heuristic will need updating.
     """
     # --- Try loading as a CA certificate ---
     try:
@@ -502,64 +508,6 @@ def _log_ca_bundle_contents(bundle_path: str) -> None:
     except (ssl.SSLError, OSError) as exc:
         logger.debug("Could not parse CA bundle '%s': %s", bundle_path, exc)
 
-    # Also log any leaf certificates in the bundle that
-    # get_ca_certs() won't return (CA:FALSE).
-    try:
-        with open(bundle_path, "r", encoding="utf-8") as fh:
-            pem_data = fh.read()
-        pem_blocks = re.findall(
-            r"(-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----)",
-            pem_data,
-            re.DOTALL,
-        )
-        leaf_idx = 0
-        for block in pem_blocks:
-            # Write each cert to a temp context to decode it
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".pem", delete=True
-            ) as tmp:
-                tmp.write(block)
-                tmp.flush()
-                try:
-                    cert_dict = ssl._ssl._test_decode_cert(  # noqa: SLF001
-                        tmp.name
-                    )
-                    if cert_dict:
-                        # Check if this is a leaf cert (not returned
-                        # by get_ca_certs).
-                        test_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                        test_ctx.load_verify_locations(tmp.name)
-                        if not test_ctx.get_ca_certs():
-                            leaf_idx += 1
-                            logger.debug(
-                                "  [leaf-%d] Subject: %s\n"
-                                "            Issuer : %s\n"
-                                "            Serial : %s\n"
-                                "            Valid  : %s → %s",
-                                leaf_idx,
-                                _format_cert_name(
-                                    cert_dict.get("subject")
-                                ),
-                                _format_cert_name(
-                                    cert_dict.get("issuer")
-                                ),
-                                cert_dict.get(
-                                    "serialNumber", "<unknown>"
-                                ),
-                                cert_dict.get(
-                                    "notBefore", "<unknown>"
-                                ),
-                                cert_dict.get(
-                                    "notAfter", "<unknown>"
-                                ),
-                            )
-                except Exception:
-                    pass
-    except Exception as exc:
-        logger.debug(
-            "Could not scan bundle for leaf certs: %s", exc
-        )
-
 
 # Deferred call — helpers above must be defined before this executes.
 if CA_BUNDLE_PATH and CLUSTERS:
@@ -639,6 +587,7 @@ def _get_cert_subjects(cert: dict) -> set[str]:
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024  # 1 MB
 
 
 @app.before_request
@@ -1335,7 +1284,7 @@ if __name__ == "__main__":
         if os.path.isfile(TLS_CERT_FILE) and os.path.isfile(TLS_KEY_FILE):
             # Build an SSLContext so we can optionally enable mTLS.
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_3
             ssl_context.load_cert_chain(TLS_CERT_FILE, TLS_KEY_FILE)
             logger.info(
                 "TLS enabled with cert=%s key=%s", TLS_CERT_FILE, TLS_KEY_FILE
