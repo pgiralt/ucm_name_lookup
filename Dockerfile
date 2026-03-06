@@ -37,7 +37,7 @@
 # ---------------------------------------------------------------------------
 
 # ---- Stage 1: Build dependencies ----
-FROM python:3.12-slim AS builder
+FROM python:3.12-slim@sha256:ccc7089399c8bb65dd1fb3ed6d55efa538a3f5e7fca3f5988ac3b5b87e593bf0 AS builder
 
 WORKDIR /build
 
@@ -48,7 +48,7 @@ RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
 # ---- Stage 2: Runtime image ----
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:ccc7089399c8bb65dd1fb3ed6d55efa538a3f5e7fca3f5988ac3b5b87e593bf0
 
 # Prevent Python from writing .pyc files and enable unbuffered output
 # so that log messages appear immediately in `docker logs`.

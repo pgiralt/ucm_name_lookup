@@ -75,7 +75,7 @@ if _log_dir:
                 "stream": "ext://sys.stderr",
             },
             "error_file": {
-                "class": "logging.handlers.RotatingFileHandler",
+                "class": "concurrent_log_handler.ConcurrentRotatingFileHandler",
                 "formatter": "generic",
                 "filename": _error_log_file,
                 "maxBytes": _log_max_bytes,
@@ -87,7 +87,7 @@ if _log_dir:
                 "stream": "ext://sys.stdout",
             },
             "access_file": {
-                "class": "logging.handlers.RotatingFileHandler",
+                "class": "concurrent_log_handler.ConcurrentRotatingFileHandler",
                 "formatter": "access",
                 "filename": _access_log_file,
                 "maxBytes": _log_max_bytes,

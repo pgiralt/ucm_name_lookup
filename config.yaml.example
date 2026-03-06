@@ -59,10 +59,11 @@ flask_port: 5000
 #                      requests are accepted. When defined, only these
 #                      source IPs are permitted for this cluster.
 #   ca_file          - Path to the CA certificate (PEM) that signed the
-#                      client certificates for this cluster. Used by the
-#                      Flask dev server to build the mTLS trust store.
-#                      For Gunicorn, concatenate all cluster CA files into
-#                      a single bundle and pass it via --ca-certs.
+#                      client certificates for this cluster. Must be a
+#                      root CA certificate (CA:TRUE), not a leaf cert.
+#                      When ca_bundle_path is set, all cluster ca_file
+#                      entries are auto-concatenated into a single bundle
+#                      for Gunicorn's --ca-certs at startup.
 #   allowed_subjects - List of expected Common Name (CN) and/or Subject
 #                      Alternative Name (SAN) values for client certificates
 #                      from this cluster. When defined, the connecting

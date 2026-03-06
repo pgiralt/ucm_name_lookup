@@ -8,3 +8,6 @@ __pycache__/
 *.md
 Dockerfile
 .dockerignore
+certs/
+logs/
+.env

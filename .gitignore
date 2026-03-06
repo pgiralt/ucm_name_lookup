@@ -1,6 +1,9 @@
 # Local configuration (copy config.yaml.example to config.yaml and customize)
 config.yaml
 
+# Docker Compose environment (copy .env.example to .env and customize)
+.env
+
 # Generated certificates and keys (see setup_certs.sh)
 certs/
 

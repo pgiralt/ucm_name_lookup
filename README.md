@@ -18,6 +18,24 @@ A CURRI (Cisco Unified Routing Rules Interface) server that provides phone numbe
 - pip
 - OpenSSL CLI (`openssl`) — required by `setup_certs.sh` for certificate generation
 
+## Quick Start
+
+Get the service running in under two minutes:
+
+```bash
+# 1. Clone and install
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp config.yaml.example config.yaml
+
+# 2. Edit phone_directory.csv with your phone number → display name mappings
+
+# 3. Run (HTTP, development)
+python main.py
+```
+
+The service is now listening on `http://0.0.0.0:5000/curri`. Point a UCM External Call Control profile at this URL to start testing. See [Production Deployment Checklist](#production-deployment-checklist) when you're ready to deploy with HTTPS and mTLS.
+
 ## Installation
 
 ```bash
@@ -44,6 +62,9 @@ cp config.yaml.example config.yaml
 |---|---|---|
 | `csv_file_path` | `phone_directory.csv` | Path to the phone directory CSV file |
 | `log_level` | `INFO` | Logging level: DEBUG, INFO, WARNING, ERROR |
+| `log_dir` | *(none)* | Directory for rotating log files (see [Logging](#logging)) |
+| `log_max_bytes` | `10485760` | Max size in bytes per log file before rotation (10 MB) |
+| `log_backup_count` | `5` | Number of rotated log files to keep |
 | `flask_host` | `0.0.0.0` | Host to bind to (dev server only) |
 | `flask_port` | `5000` | Port to bind to (dev server only) |
 | `tls_cert_file` | *(none)* | Path to TLS certificate (dev server HTTPS) |
@@ -57,6 +78,28 @@ Two environment variables are still supported:
 |---|---|
 | `CONFIG_FILE` | Path to the YAML configuration file (default: `config.yaml`) |
 | `LOG_LEVEL` | Overrides the `log_level` value in the config file when set |
+
+### Logging
+
+By default, all log output goes to stdout/stderr (visible via `docker logs`). To also write rotating log files, set `log_dir` in `config.yaml`:
+
+```yaml
+log_dir: logs
+```
+
+When enabled, three log files are created:
+
+| File | Contents |
+|---|---|
+| `app.log` | Application log — startup, CURRI requests, lookups, cluster enforcement |
+| `access.log` | Gunicorn HTTP access log |
+| `error.log` | Gunicorn startup and error log |
+
+Each file rotates at `log_max_bytes` (default 10 MB) and keeps `log_backup_count` backups (default 5). With defaults, maximum disk usage is ~150 MB (3 files × 10 MB × 5 backups + active files). Log rotation uses file locking (`concurrent-log-handler`) so it is safe with Gunicorn's multiple worker processes.
+
+Console output is **always active** alongside file logging so `docker logs` continues to work.
+
+> **Docker:** The `docker-compose.yml` mounts `./logs` into the container. Create the directory on the host or let Docker create it automatically. The `logs/` directory is gitignored.
 
 ## Multi-Cluster Support
 
@@ -132,7 +175,7 @@ Both options accept these flags:
 | `--mode` | `selfsigned` | `selfsigned` or `csr` |
 | `--out-dir` | `certs` | Output directory for generated files |
 | `--days` | `365` | Certificate validity (self-signed only) |
-| `--key-type` | `ecdsa` | `ecdsa` (P-256) or `rsa` (2048-bit) |
+| `--key-type` | `ecdsa` | `ecdsa` (P-256) or `rsa` (4096-bit) |
 
 > **Tip:** If your UCM references the server by IP address, pass the IP as the hostname:
 > ```bash
@@ -223,23 +266,13 @@ Override any setting via the `GUNICORN_CMD_ARGS` environment variable or by pass
 
 **Docker Compose (mTLS):**
 
-TLS and mTLS are enabled automatically when the `certs/` directory contains the server certificate, key, and cluster CA files. Set `ca_bundle_path` to a writable path (e.g., `/tmp/ca-bundle.pem`) in `config.yaml` so the auto-generated bundle can be written inside the container.
+TLS and mTLS are enabled automatically when the `certs/` directory contains the server certificate, key, and cluster CA files. Set `ca_bundle_path` to a writable path (e.g., `/tmp/ca-bundle.pem`) in `config.yaml` so the auto-generated bundle can be written inside the container (since `certs/` is mounted read-only).
 
-```yaml
-services:
-  ucm-name-lookup:
-    build: .
-    container_name: ucm-name-lookup
-    ports:
-      - "443:443"
-    volumes:
-      - ./config.yaml:/app/config.yaml:ro
-      - ./phone_directory.csv:/app/phone_directory.csv:ro
-      - ./certs:/app/certs:ro
-    restart: unless-stopped
+```bash
+docker compose up -d
 ```
 
-No `GUNICORN_CMD_ARGS` needed — `gunicorn.conf.py` reads `config.yaml` and auto-configures everything.
+No `GUNICORN_CMD_ARGS` needed — `gunicorn.conf.py` reads `config.yaml` and auto-configures everything. See [Docker Compose](#docker-compose) for the full `docker-compose.yml` reference.
 
 ### TLS Chain Validation
 
@@ -369,21 +402,37 @@ The container runs Gunicorn with 4 gthread workers (4 threads each, 16 total). T
 
 ### Docker Compose
 
-A `docker-compose.yml` is included for convenience:
+A `docker-compose.yml` is included for convenience. The default configuration runs with HTTPS when certificates are present:
 
 ```yaml
 services:
   ucm-name-lookup:
     build: .
     container_name: ucm-name-lookup
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+    tmpfs:
+      - /tmp
+      - /dev/shm
     ports:
-      - "80:80"
+      - "443:443"
     volumes:
+      - ./config.yaml:/app/config.yaml:ro
       - ./phone_directory.csv:/app/phone_directory.csv:ro
-    environment:
-      - LOG_LEVEL=INFO
+      - ./certs:/app/certs:ro
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "2.0"
     restart: unless-stopped
 ```
+
+- **`tmpfs`** mounts provide writable scratch space for CA bundle generation (`/tmp`) and Gunicorn worker heartbeats (`/dev/shm`) without writing to the container filesystem.
+- **`./logs:/app/logs`** persists rotating log files on the host (requires `log_dir: logs` in `config.yaml`).
+- **`deploy.resources.limits`** caps memory and CPU to prevent a runaway process from consuming all host resources. Adjust to match your hardware.
+- For HTTP-only (no TLS), change the port to `"80:80"`.
+- Copy `.env.example` to `.env` and set `DOCKER_UID`/`DOCKER_GID` to match your cert file owner.
 
 **Start the service:**
 ```bash
@@ -392,7 +441,11 @@ docker compose up -d
 
 **View logs:**
 ```bash
+# Console logs
 docker compose logs -f
+
+# File logs (when log_dir is configured)
+tail -f logs/app.log
 ```
 
 **Rebuild after code changes:**
@@ -400,25 +453,6 @@ docker compose logs -f
 docker compose down
 docker compose build --no-cache
 docker compose up -d
-```
-
-The example above maps host port 80 to the container's port 80 (HTTP). When TLS is enabled, use `443:443` instead — see the HTTPS example below.
-
-To enable HTTPS via Docker Compose, mount the `certs/` directory. `gunicorn.conf.py` auto-detects the cert/key and switches to HTTPS on port 443:
-
-```yaml
-services:
-  ucm-name-lookup:
-    build: .
-    container_name: ucm-name-lookup
-    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
-    ports:
-      - "443:443"
-    volumes:
-      - ./config.yaml:/app/config.yaml:ro
-      - ./phone_directory.csv:/app/phone_directory.csv:ro
-      - ./certs:/app/certs:ro
-    restart: unless-stopped
 ```
 
 **Private key permissions:** The `server.key` file is created with `chmod 600` (owner-only read) for security. The container must run as the UID that owns the key file. Two approaches:
@@ -508,6 +542,53 @@ curl -X POST http://localhost:5000/curri \
   </Subject>
 </Request>'
 ```
+
+## Production Deployment Checklist
+
+Use this checklist when moving from a development setup to a production deployment. Each item references the relevant section above for details.
+
+### Certificates and mTLS
+
+- [ ] Generate a server certificate with `./setup_certs.sh --hostname <fqdn>` (see [Step 1](#step-1--generate-the-server-certificate))
+- [ ] Export each UCM cluster's `CallManager.pem` CA certificate (see [Step 2](#step-2--export-ucms-ca-certificate))
+- [ ] Upload `certs/server.crt` to every UCM node's **CallManager-trust** store (see [Step 3](#step-3--upload-the-server-certificate-to-ucm))
+- [ ] Set `ca_bundle_path` in `config.yaml` (e.g., `/tmp/ca-bundle.pem` for Docker)
+
+### Cluster access control
+
+- [ ] Define at least one cluster in `config.yaml` with all three controls:
+  - `ca_file` — path to the cluster's root CA certificate
+  - `allowed_subjects` — CN/SAN values of the UCM nodes
+  - `allowed_ips` — IP addresses or CIDR ranges of the UCM nodes
+- [ ] Verify the CA file is a root certificate (`CA:TRUE`), not a leaf certificate
+
+### Logging
+
+- [ ] Set `log_dir: logs` in `config.yaml` to enable rotating file logs
+- [ ] Mount the `./logs` directory in Docker Compose (included by default)
+- [ ] Optionally adjust `log_max_bytes` and `log_backup_count` for your disk capacity
+
+### Docker hardening
+
+- [ ] Set `DOCKER_UID` and `DOCKER_GID` in `.env` to match the cert file owner
+- [ ] Mount `config.yaml`, `phone_directory.csv`, and `certs/` as read-only (`:ro`)
+- [ ] Keep `tmpfs` mounts for `/tmp` and `/dev/shm`
+- [ ] Verify the container starts: `docker compose up -d && docker compose logs -f`
+
+### UCM configuration
+
+- [ ] Create an External Call Control profile pointing to `https://<server>:443/curri`
+- [ ] Set **Routing Request Timer** (e.g., 2000 ms)
+- [ ] Set **Call Treatment on Failures** to continue routing
+- [ ] Apply the ECC profile to the desired Directory Numbers or patterns
+- [ ] Tune **Maximum Connection Count to PDP** to match Gunicorn workers × threads (default: 16)
+
+### Verification
+
+- [ ] Confirm health check passes: `curl -k https://localhost:443/health` (or check `docker compose ps`)
+- [ ] Place a test call through UCM and verify the caller display name is updated
+- [ ] Check log files are being written: `ls -la logs/`
+- [ ] Set `log_level: DEBUG` temporarily if troubleshooting TLS issues
 
 ## License
 

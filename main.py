@@ -55,6 +55,7 @@ import sys
 from dataclasses import dataclass, field
 from xml.sax.saxutils import escape as xml_escape
 
+from concurrent_log_handler import ConcurrentRotatingFileHandler
 import yaml
 from defusedxml import ElementTree as ET
 from flask import Flask, Response, request
@@ -153,7 +154,7 @@ logging.root.addHandler(_console_handler)
 # Rotating file handler (active when log_dir is configured).
 if LOG_DIR:
     os.makedirs(LOG_DIR, exist_ok=True)
-    _file_handler = logging.handlers.RotatingFileHandler(
+    _file_handler = ConcurrentRotatingFileHandler(
         os.path.join(LOG_DIR, "app.log"),
         maxBytes=LOG_MAX_BYTES,
         backupCount=LOG_BACKUP_COUNT,
@@ -614,6 +615,17 @@ def _get_cert_subjects(cert: dict) -> set[str]:
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024  # 1 MB
+
+
+@app.after_request
+def _set_security_headers(response):
+    """Add defense-in-depth security headers to every response."""
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = "default-src 'none'"
+    response.headers.pop("Server", None)
+    return response
 
 
 @app.before_request

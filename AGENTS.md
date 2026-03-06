@@ -119,7 +119,14 @@ Numbers are normalized (strip formatting chars, preserve leading `+`) before loo
 - **`yaml.safe_load` only** — prevents unsafe deserialization
 - **No secrets in config.yaml** — TLS keys go through Gunicorn CLI or file mounts
 - **Logging**: use the `ucm_name_lookup` logger; never log secrets, tokens, or raw cert data
+- **File logging**: when `log_dir` is set in config, `ConcurrentRotatingFileHandler` (from `concurrent-log-handler`) writes `app.log`, and Gunicorn's `logconfig_dict` writes `access.log` + `error.log` — all with file-locked rotation safe for multiple Gunicorn workers
+- **Security headers**: `@app.after_request` sets `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Cache-Control: no-store`, `Content-Security-Policy: default-src 'none'`, and strips the `Server` header
+- **Request body limit**: Flask `MAX_CONTENT_LENGTH` is set to 1 MB to prevent oversized payload DoS
 - **TLS minimum**: TLSv1.2 enforced in dev server SSLContext
+- **`logs/` directory**: gitignored; mounted as a writable volume in Docker Compose
+- **`.env` / `.env.example`**: Docker Compose UID/GID variables; `.env` is gitignored
+- **Docker image pinning**: Dockerfile uses `python:3.12-slim@sha256:...` digest for reproducible builds
+- **Resource limits**: `docker-compose.yml` sets `memory: 512M` and `cpus: "2.0"`
 
 ## Development
 
