@@ -1345,6 +1345,17 @@ def curri_endpoint():
     if request.method == "HEAD":
         return Response(status=200, content_type='text/xml; charset="utf-8"')
 
+    # --- Validate Content-Type (defense-in-depth) ---
+    content_type = request.content_type or ""
+    if content_type and not (
+        "text/xml" in content_type or "application/xml" in content_type
+    ):
+        logger.warning(
+            "Unexpected Content-Type '%s' from %s — expected text/xml",
+            content_type,
+            request.remote_addr,
+        )
+
     # --- Read the raw XML body from UCM ---
     xml_data = request.data
     if not xml_data:
@@ -1390,7 +1401,12 @@ def curri_endpoint():
     # --- Build and return the XACML response (always Permit + Continue) ---
     response_xml = build_continue_response(display_name)
 
-    logger.debug("XACML response:\n%s", response_xml)
+    if OBFUSCATE_PII:
+        logger.debug(
+            "XACML response body suppressed (obfuscate_pii is enabled)"
+        )
+    else:
+        logger.debug("XACML response:\n%s", response_xml)
 
     return Response(
         response_xml,

@@ -146,7 +146,6 @@ Numbers are normalized (strip formatting chars, preserve leading `+`) before loo
 - **`logs/` directory**: gitignored; mounted as a writable volume in Docker Compose
 - **`.env` / `.env.example`**: Docker Compose UID/GID variables; `.env` is gitignored
 - **Docker image pinning**: Dockerfile uses `python:3.12-slim@sha256:...` digest for reproducible builds
-- **Resource limits**: `docker-compose.yml` sets `memory: 512M` and `cpus: "2.0"`
 
 ## Development
 
