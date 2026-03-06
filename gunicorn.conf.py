@@ -19,29 +19,6 @@ import ssl
 import yaml
 
 # ---------------------------------------------------------------------------
-# Enforce TLS 1.3 minimum protocol version
-# ---------------------------------------------------------------------------
-# Gunicorn does not expose SSLContext.minimum_version in its configuration.
-# Replace ssl.SSLContext with a factory function that creates a real context
-# and sets TLS 1.3 as the floor before returning it. This affects the server
-# TLS listener that Gunicorn creates internally via ssl_wrap_socket().
-#
-# Note: UCM must support TLS 1.3 for mTLS connections to succeed. If your
-# UCM cluster only supports TLS 1.2, change TLSv1_3 to TLSv1_2 below.
-
-_OrigSSLContext = ssl.SSLContext
-
-
-def _tls13_ssl_context(*args, **kwargs):
-    """Factory that wraps ssl.SSLContext to enforce TLS 1.3 minimum."""
-    ctx = _OrigSSLContext(*args, **kwargs)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-    return ctx
-
-
-ssl.SSLContext = _tls13_ssl_context
-
-# ---------------------------------------------------------------------------
 # Base Gunicorn settings
 # ---------------------------------------------------------------------------
 

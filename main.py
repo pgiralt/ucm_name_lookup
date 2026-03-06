@@ -1284,7 +1284,7 @@ if __name__ == "__main__":
         if os.path.isfile(TLS_CERT_FILE) and os.path.isfile(TLS_KEY_FILE):
             # Build an SSLContext so we can optionally enable mTLS.
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_3
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
             ssl_context.load_cert_chain(TLS_CERT_FILE, TLS_KEY_FILE)
             logger.info(
                 "TLS enabled with cert=%s key=%s", TLS_CERT_FILE, TLS_KEY_FILE
