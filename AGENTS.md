@@ -68,9 +68,11 @@ The `clusters` section in `config.yaml` supports multiple UCM clusters. Each clu
 
 A request must match **at least one** cluster. Matching means passing **all** of that cluster's defined rules.
 
-**Two-layer app enforcement** per cluster (in `_enforce_cluster_access`):
-1. IP address check against `allowed_networks`
-2. Certificate CN/SAN check against `allowed_subjects`
+**Two-layer app enforcement** per cluster (in `_enforce_cluster_access`), both using **deny-by-default** semantics:
+1. IP address check against `allowed_networks` — empty list denies all IPs
+2. Certificate CN/SAN check against `allowed_subjects` — empty set denies all subjects
+
+A cluster must explicitly list what it permits. Omitting a rule blocks all traffic for that criterion.
 
 **TLS-layer chain validation** is handled separately by Gunicorn with `CERT_REQUIRED`. When `ca_file` is set, the client certificate must chain to a trusted root CA in the combined CA bundle — connections that fail chain validation are rejected at the TLS handshake before reaching the application.
 
@@ -80,12 +82,17 @@ The `ca_file` **must** be the root CA certificate (`CA:TRUE`) that anchors the c
 
 ### Secure by default
 
-The service **refuses to start** without TLS certificates unless `insecure_mode: true` is explicitly set in `config.yaml`. This applies to both the dev server (`main.py`) and production (`gunicorn.conf.py`).
+The service **refuses to start** unless both conditions are met:
+1. TLS certificates are configured.
+2. At least one cluster is defined (to restrict access to trusted UCM servers).
+
+Both checks are enforced independently in `main.py` and `gunicorn.conf.py`. Setting `insecure_mode: true` bypasses both requirements (TLS and clusters).
 
 When `insecure_mode` is enabled:
 - A prominent ASCII warning banner is printed at startup.
 - A security warning is logged every hour via a daemon `threading.Timer`.
 - The service runs on plain HTTP.
+- Clusters are optional (all clients accepted if none defined).
 
 The `insecure_mode` config value defaults to `false`. The check uses `_config.get("insecure_mode", False) is True` to ensure only an explicit boolean `true` enables it.
 

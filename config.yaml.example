@@ -23,16 +23,19 @@
 # Security Mode (IMPORTANT — read before first run)
 # ---------------------------------------------------------------------------
 #
-# This service is SECURE BY DEFAULT. It will NOT start unless TLS
-# certificates are configured (tls_cert_file and tls_key_file below,
-# or certs/server.crt and certs/server.key for Gunicorn).
+# This service is SECURE BY DEFAULT. It will NOT start unless:
+#   1. TLS certificates are configured (tls_cert_file and tls_key_file
+#      below, or certs/server.crt and certs/server.key for Gunicorn).
+#   2. At least one cluster is defined (see the clusters section below)
+#      to restrict access to trusted UCM servers.
 #
-# For development or testing without TLS, you must explicitly enable
-# insecure mode by uncommenting the line below and setting it to true.
-# When insecure_mode is enabled:
+# For development or testing without TLS or clusters, you must
+# explicitly enable insecure mode by uncommenting the line below and
+# setting it to true. When insecure_mode is enabled:
 #   - A prominent warning banner is displayed at startup.
 #   - A security warning is logged every hour.
 #   - All traffic is transmitted in unencrypted plaintext HTTP.
+#   - The cluster requirement is relaxed (clusters are optional).
 #
 # NEVER enable insecure_mode in production. Use ./setup_certs.sh to
 # generate certificates for TLS/mTLS instead.
@@ -92,10 +95,14 @@ flask_port: 5000
 # A connecting client must match ALL rules defined for at least ONE cluster
 # to be granted access to the /curri endpoint.
 #
+# Every rule uses DENY-BY-DEFAULT semantics: omitting a rule blocks
+# all traffic for that criterion rather than allowing it. A cluster
+# must explicitly list what it permits.
+#
 # Per-cluster settings:
 #   allowed_ips      - List of IP addresses and/or CIDR networks whose
-#                      requests are accepted. When defined, only these
-#                      source IPs are permitted for this cluster.
+#                      requests are accepted. An empty or missing list
+#                      denies ALL source IPs for this cluster.
 #   ca_file          - Path to the CA certificate (PEM) that signed the
 #                      client certificates for this cluster. Must be a
 #                      root CA certificate (CA:TRUE), not a leaf cert.
@@ -104,12 +111,15 @@ flask_port: 5000
 #                      for Gunicorn's --ca-certs at startup.
 #   allowed_subjects - List of expected Common Name (CN) and/or Subject
 #                      Alternative Name (SAN) values for client certificates
-#                      from this cluster. When defined, the connecting
-#                      client's certificate must contain at least one
-#                      matching CN or SAN entry.
+#                      from this cluster. An empty or missing list denies
+#                      ALL certificate subjects for this cluster.
 #
-# When no clusters are defined, IP filtering and certificate subject
-# validation are disabled (all clients are accepted).
+# When insecure_mode is disabled (the default), at least one cluster
+# MUST be defined or the service will refuse to start. This ensures
+# that only trusted UCM servers can reach the /curri endpoint.
+#
+# When insecure_mode is enabled (development/testing only), clusters
+# are optional — if none are defined, all clients are accepted.
 #
 # Example:
 #
@@ -139,5 +149,3 @@ flask_port: 5000
 # Note: in Docker, if certs/ is mounted read-only, use a writable
 # path such as /tmp/ca-bundle.pem instead.
 # ca_bundle_path: certs/ca-bundle.pem
-
-clusters: {}

@@ -123,6 +123,20 @@ _bundle_path = _config.get("ca_bundle_path", "")
 _clusters = _config.get("clusters", {})
 _insecure_mode = _config.get("insecure_mode", False) is True
 
+# --- Require at least one cluster in secure mode ---
+if not _insecure_mode and not _clusters:
+    print(
+        "[ERROR] No clusters defined and insecure_mode is not enabled. "
+        "At least one cluster must be configured to restrict access to "
+        "trusted UCM servers. Either:\n"
+        f"  1. Define one or more clusters in {_config_path} with "
+        "allowed_ips, ca_file, and/or allowed_subjects\n"
+        f"  2. Set 'insecure_mode: true' in {_config_path} to bypass "
+        "this requirement (development/testing only)",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 # --- PII obfuscation salt ---
 # Generate the HMAC salt once in the master process and expose it via an
 # environment variable so that every forked worker inherits the same value.

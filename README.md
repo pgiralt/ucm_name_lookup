@@ -121,7 +121,7 @@ The `clusters` section in `config.yaml` lets you define access rules for one or 
 - **`ca_file`** — path to the CA certificate (PEM) that signed the cluster's client certificates
 - **`allowed_subjects`** — expected CN and/or SAN values in client certificates
 
-A request is authorized if it matches **at least one** cluster. Matching a cluster means satisfying **all** of its defined rules. Rules that are omitted for a cluster are not enforced for that cluster.
+A request is authorized if it matches **at least one** cluster. Matching a cluster means satisfying **all** of its rules. Every rule uses **deny-by-default** semantics: omitting `allowed_ips` denies all IPs, and omitting `allowed_subjects` denies all certificate subjects. A cluster must explicitly list what it permits.
 
 ```yaml
 clusters:
@@ -144,7 +144,7 @@ clusters:
       - cucm-branch.example.com
 ```
 
-When **no clusters** are defined, IP filtering and certificate subject validation are disabled — all clients are accepted (same behavior as a fresh install).
+When **no clusters** are defined and `insecure_mode` is enabled, IP filtering and certificate subject validation are disabled — all clients are accepted. In secure mode (the default), at least one cluster **must** be defined or the service will refuse to start.
 
 > **Tip:** To find the CN/SAN values of your UCM certificates, run:
 > ```bash
@@ -153,11 +153,14 @@ When **no clusters** are defined, IP filtering and certificate subject validatio
 
 ## Secure by Default
 
-The service enforces a **secure by default** posture: it **will not start** unless TLS certificates are properly configured. This ensures that the service never accidentally runs in plaintext HTTP mode in production.
+The service enforces a **secure by default** posture: it **will not start** unless both of the following are true:
 
-If TLS is not configured (`tls_cert_file`/`tls_key_file` are not set, or the certificate files are missing), the service exits immediately with an error message explaining how to fix it.
+1. **TLS certificates** are properly configured — ensures traffic is encrypted.
+2. **At least one cluster** is defined — ensures only trusted UCM servers can reach the `/curri` endpoint.
 
-For **development and testing only**, you can override this by setting `insecure_mode: true` in `config.yaml`:
+If either requirement is not met, the service exits immediately with an error message explaining how to fix it.
+
+For **development and testing only**, you can override both requirements by setting `insecure_mode: true` in `config.yaml`:
 
 ```yaml
 # WARNING: Development/testing only — never enable in production!
@@ -169,6 +172,7 @@ When insecure mode is enabled:
 - A **prominent warning banner** is printed at startup
 - A **security warning is logged every hour** as a persistent reminder
 - All traffic is transmitted in **unencrypted plaintext HTTP**
+- The **cluster requirement is relaxed** — clusters are optional
 
 To run the service securely, generate TLS certificates and remove (or set to `false`) the `insecure_mode` setting:
 
