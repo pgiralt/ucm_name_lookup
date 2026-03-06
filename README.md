@@ -185,7 +185,7 @@ See [mTLS Setup Guide](#mtls-setup-guide) for production certificate setup.
 
 ## PII Obfuscation
 
-For environments that must comply with privacy regulations (e.g. GDPR), the service can obfuscate personally identifiable information in log output. When `obfuscate_pii: true` is set in `config.yaml`, all phone numbers and display names are replaced with a truncated SHA-256 hash:
+For environments that must comply with privacy regulations (e.g. GDPR), the service can obfuscate personally identifiable information in log output. When `obfuscate_pii: true` is set in `config.yaml`, all phone numbers and display names are replaced with a salted HMAC-SHA256 hash:
 
 ```
 # Normal logging
@@ -195,7 +195,9 @@ Exact match found: +12125551212 -> John Doe
 Exact match found: {! 9f86d081884c7d659a2f !} -> {! a591a6d40bf420404a01 !}
 ```
 
-The same input always produces the same hash, so operators can still correlate repeated values across log entries without seeing the actual data. The hash is the first 24 hex characters of the SHA-256 digest, wrapped in `{! … !}` delimiters for easy identification.
+The same input always produces the same hash within a single process lifetime, so operators can correlate repeated values across log entries without seeing the actual data. The hash is the first 24 hex characters of the HMAC-SHA256 digest, wrapped in `{! … !}` delimiters for easy identification.
+
+A random 32-byte salt is generated from a CSPRNG at each startup and kept only in memory — it is never logged or persisted. This prevents rainbow-table reversal of hashed phone numbers (which have a small keyspace). Because the salt changes on every restart, hashes from different process lifetimes are **not** comparable.
 
 To enable:
 

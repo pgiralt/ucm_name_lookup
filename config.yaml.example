@@ -44,12 +44,15 @@
 # ---------------------------------------------------------------------------
 #
 # When enabled, phone numbers and display names are replaced with
-# truncated SHA-256 hashes in all log output. The format is:
+# salted HMAC-SHA256 hashes in all log output. The format is:
 #
 #   {! <24-char-hex-hash> !}
 #
-# This allows operators to correlate repeated values (the same input
-# always produces the same hash) without exposing the actual data.
+# A random salt is generated from a CSPRNG at each startup and kept
+# only in memory — never logged or persisted. This prevents rainbow-
+# table reversal of hashed phone numbers. The same input produces the
+# same hash within a single process lifetime, allowing operators to
+# correlate repeated values. Hashes are not comparable across restarts.
 # Useful for environments that must comply with privacy regulations.
 #
 # obfuscate_pii: true

@@ -91,7 +91,9 @@ The `insecure_mode` config value defaults to `false`. The check uses `_config.ge
 
 ### PII obfuscation
 
-When `obfuscate_pii: true` is set in `config.yaml`, phone numbers and display names are replaced with truncated SHA-256 hashes in all log output. The format is `{! <24-char-hex> !}`. The `_obfuscate_pii()` helper returns the original value when disabled or the hash when enabled. This covers CSV loading warnings, XACML attribute parsing, phone number lookup results, and the CURRI request processing log line.
+When `obfuscate_pii: true` is set in `config.yaml`, phone numbers and display names are replaced with truncated SHA-256 hashes in all log output. The format is `{! <24-char-hex> !}`. The `_obfuscate_pii()` helper returns the original value when disabled or the hash when enabled. This covers CSV loading warnings, XACML attribute parsing, phone number lookup results, the CURRI request processing log line, and the raw XACML body debug log (suppressed entirely when obfuscation is active).
+
+Hashes use HMAC-SHA256 with a per-startup random salt (32 bytes from `secrets.token_bytes`). The salt lives only in memory — never logged or persisted — preventing rainbow-table reversal of the small phone-number keyspace. Hashes are consistent within a process lifetime but not comparable across restarts. In production, `gunicorn.conf.py` generates the salt once in the master process and passes it to workers via the `_PII_SALT` environment variable so all workers produce identical hashes. The dev server generates its own salt locally.
 
 ### CA bundle auto-generation
 

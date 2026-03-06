@@ -47,10 +47,12 @@ Environment Variables:
 
 import csv
 import hashlib
+import hmac
 import ipaddress
 import logging
 import logging.handlers
 import os
+import secrets
 import ssl
 import sys
 import threading
@@ -127,25 +129,48 @@ LOG_LEVEL = os.environ.get(
 INSECURE_MODE = _config.get("insecure_mode", False) is True
 
 # PII obfuscation flag. When True, phone numbers and display names are
-# replaced with a SHA-256 hash in log output so that operators can
-# correlate identical values without seeing the actual data.
+# replaced with a salted HMAC-SHA256 hash in log output so that operators
+# can correlate identical values without seeing the actual data.
 OBFUSCATE_PII = _config.get("obfuscate_pii", False) is True
+
+# Per-startup random salt for PII hashing. In production (Gunicorn),
+# the salt is generated once in the master process and passed to workers
+# via the _PII_SALT environment variable so all workers produce
+# consistent hashes. In development (Flask dev server), a fresh salt
+# is generated locally. The salt is never logged or persisted. This
+# prevents precomputed rainbow-table attacks against the small keyspace
+# of phone numbers. Because the salt changes on every restart, hashes
+# from different process lifetimes are not comparable.
+_pii_salt_hex = os.environ.get("_PII_SALT", "") if OBFUSCATE_PII else ""
+_PII_SALT: bytes = (
+    bytes.fromhex(_pii_salt_hex) if _pii_salt_hex
+    else secrets.token_bytes(32) if OBFUSCATE_PII
+    else b""
+)
 
 
 def _obfuscate_pii(value: str | None) -> str | None:
     """Return a privacy-safe representation of *value* for logging.
 
-    When ``OBFUSCATE_PII`` is enabled, the value is hashed with SHA-256
-    and the first 24 hex characters are returned wrapped in ``{! … !}``
-    delimiters. This allows log readers to recognise when two values
-    are identical without revealing the underlying data.
+    When ``OBFUSCATE_PII`` is enabled, the value is hashed with
+    HMAC-SHA256 using a per-startup random salt and the first 24 hex
+    characters are returned wrapped in ``{! … !}`` delimiters. This
+    allows log readers to recognise when two values are identical
+    within the same process lifetime without revealing the underlying
+    data.
+
+    The random salt is generated from a CSPRNG at startup and kept
+    only in memory. It is never logged or persisted, which prevents
+    rainbow-table reversal of hashed phone numbers.
 
     When obfuscation is disabled the original value is returned unchanged.
     ``None`` and empty strings are passed through as-is.
     """
     if not OBFUSCATE_PII or not value:
         return value
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+    digest = hmac.new(
+        _PII_SALT, value.encode("utf-8"), hashlib.sha256
+    ).hexdigest()[:24]
     return f"{{! {digest} !}}"
 
 

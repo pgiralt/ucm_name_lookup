@@ -16,6 +16,7 @@ Any setting here can be overridden via ``GUNICORN_CMD_ARGS``.
 """
 
 import os
+import secrets
 import ssl
 import sys
 import threading
@@ -121,6 +122,13 @@ _key = _config.get("tls_key_file", "certs/server.key")
 _bundle_path = _config.get("ca_bundle_path", "")
 _clusters = _config.get("clusters", {})
 _insecure_mode = _config.get("insecure_mode", False) is True
+
+# --- PII obfuscation salt ---
+# Generate the HMAC salt once in the master process and expose it via an
+# environment variable so that every forked worker inherits the same value.
+# This ensures consistent hashes across all workers for a given run.
+if _config.get("obfuscate_pii", False) is True:
+    os.environ["_PII_SALT"] = secrets.token_bytes(32).hex()
 
 # ---------------------------------------------------------------------------
 # Generate CA bundle from cluster CA files
