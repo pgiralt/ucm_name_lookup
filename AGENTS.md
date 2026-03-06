@@ -37,18 +37,19 @@ A **CURRI** (Cisco Unified Routing Rules Interface) server that provides phone n
 
 All application logic lives in `main.py`. This is intentional for simplicity given the service's focused scope. The file is organized in clear sections with separator comments:
 
-1. **Configuration** — YAML loading, global settings
-2. **Cluster Definitions** — `ClusterConfig` dataclass, parsing helpers
-3. **CA Bundle Generation** — auto-concatenation of cluster CA files
-4. **Client Certificate Helpers** — peer cert extraction, CN/SAN parsing
-5. **Flask Application** — `before_request` enforcement hook, routes
-6. **Prefix Trie** — efficient longest-prefix phone number matching
-7. **CSV Directory Loader** — phone directory ingestion with normalization
-8. **XACML Parser** — CURRI request parsing
-9. **CIXML Response Builder** — CURRI response construction
-10. **Phone Number Lookup** — exact then prefix match strategy
-11. **Flask Routes** — `/curri` (POST/HEAD) and `/health` (GET)
-12. **Application Startup** — directory loading, dev server TLS
+1. **Configuration** — YAML loading, global settings, insecure mode flag
+2. **Insecure Mode Warning** — banner constant, hourly warning timer
+3. **Cluster Definitions** — `ClusterConfig` dataclass, parsing helpers
+4. **CA Bundle Generation** — auto-concatenation of cluster CA files
+5. **Client Certificate Helpers** — peer cert extraction, CN/SAN parsing
+6. **Flask Application** — `before_request` enforcement hook, routes
+7. **Prefix Trie** — efficient longest-prefix phone number matching
+8. **CSV Directory Loader** — phone directory ingestion with normalization
+9. **XACML Parser** — CURRI request parsing
+10. **CIXML Response Builder** — CURRI response construction
+11. **Phone Number Lookup** — exact then prefix match strategy
+12. **Flask Routes** — `/curri` (POST/HEAD) and `/health` (GET)
+13. **Application Startup** — directory loading, secure-by-default enforcement, dev server TLS
 
 ### Configuration via YAML (not environment variables)
 
@@ -76,6 +77,17 @@ A request must match **at least one** cluster. Matching means passing **all** of
 The `ca_file` **must** be the root CA certificate (`CA:TRUE`) that anchors the client certificate chain. It can include intermediate CAs in the chain. If a leaf certificate is detected at startup, the application exits with a clear error. The root CA certificate can typically be exported from UCM OS Administration under Security > Certificate Management.
 
 **Multi-cluster trust boundary limitation:** When multiple clusters define different `ca_file` entries, all roots are combined into one CA bundle. The TLS layer cannot distinguish which root validated a given connection. Cluster isolation relies on `allowed_subjects` and `allowed_ips` having no overlap. If strict per-cluster CA isolation with overlapping subjects is needed, run separate service instances.
+
+### Secure by default
+
+The service **refuses to start** without TLS certificates unless `insecure_mode: true` is explicitly set in `config.yaml`. This applies to both the dev server (`main.py`) and production (`gunicorn.conf.py`).
+
+When `insecure_mode` is enabled:
+- A prominent ASCII warning banner is printed at startup.
+- A security warning is logged every hour via a daemon `threading.Timer`.
+- The service runs on plain HTTP.
+
+The `insecure_mode` config value defaults to `false`. The check uses `_config.get("insecure_mode", False) is True` to ensure only an explicit boolean `true` enables it.
 
 ### CA bundle auto-generation
 
@@ -113,6 +125,7 @@ Numbers are normalized (strip formatting chars, preserve leading `+`) before loo
 
 ## Important Conventions
 
+- **Secure by default** — the service will not start without TLS certificates unless `insecure_mode: true` is explicitly set in config. When insecure mode is active, a warning banner is shown at startup and a security warning is logged every hour
 - **Never reject calls** — always return Permit/Continue, even on errors or empty input
 - **`/health` is localhost-only** when clusters are defined (127.0.0.1 / ::1); unrestricted when no clusters are configured. The Docker health check uses a process-level check (scanning `/proc` for gunicorn workers) when mTLS is active, since `CERT_REQUIRED` prevents HTTP connections without a client cert
 - **`defusedxml` for all XML parsing** — prevents XXE attacks
@@ -138,7 +151,14 @@ pip install -r requirements.txt
 # Create local config from the template
 cp config.yaml.example config.yaml
 
-# Run dev server (HTTP)
+# Run dev server (requires TLS by default — secure by default)
+# Option A: Generate certs and configure TLS
+./setup_certs.sh --hostname localhost
+# Set tls_cert_file and tls_key_file in config.yaml
+python main.py
+
+# Option B: Run without TLS (dev/testing only)
+# Set 'insecure_mode: true' in config.yaml
 python main.py
 
 # Run dev server (HTTPS with mTLS — configure clusters in config.yaml first)

@@ -30,11 +30,21 @@ cp config.yaml.example config.yaml
 
 # 2. Edit phone_directory.csv with your phone number → display name mappings
 
-# 3. Run (HTTP, development)
+# 3a. Run with TLS (recommended — generate certs first)
+./setup_certs.sh --hostname localhost
+#     Then set tls_cert_file and tls_key_file in config.yaml:
+#       tls_cert_file: certs/server.crt
+#       tls_key_file: certs/server.key
+python main.py
+
+# 3b. Or run without TLS (development only — requires insecure_mode)
+#     Uncomment 'insecure_mode: true' in config.yaml, then:
 python main.py
 ```
 
-The service is now listening on `http://0.0.0.0:5000/curri`. Point a UCM External Call Control profile at this URL to start testing. See [Production Deployment Checklist](#production-deployment-checklist) when you're ready to deploy with HTTPS and mTLS.
+> **Note:** The service is **secure by default** and will not start without TLS certificates unless `insecure_mode: true` is explicitly set in `config.yaml`. See [Secure by Default](#secure-by-default) for details.
+
+Once running, point a UCM External Call Control profile at the service URL to start testing. See [Production Deployment Checklist](#production-deployment-checklist) when you're ready to deploy with HTTPS and mTLS.
 
 ## Installation
 
@@ -60,6 +70,7 @@ cp config.yaml.example config.yaml
 
 | Setting | Default | Description |
 |---|---|---|
+| `insecure_mode` | `false` | When `true`, allows the service to start without TLS (see [Secure by Default](#secure-by-default)) |
 | `csv_file_path` | `phone_directory.csv` | Path to the phone directory CSV file |
 | `log_level` | `INFO` | Logging level: DEBUG, INFO, WARNING, ERROR |
 | `log_dir` | *(none)* | Directory for rotating log files (see [Logging](#logging)) |
@@ -138,6 +149,38 @@ When **no clusters** are defined, IP filtering and certificate subject validatio
 > ```bash
 > openssl x509 -text -noout -in CallManager.pem | grep -E 'Subject:|DNS:|IP Address:'
 > ```
+
+## Secure by Default
+
+The service enforces a **secure by default** posture: it **will not start** unless TLS certificates are properly configured. This ensures that the service never accidentally runs in plaintext HTTP mode in production.
+
+If TLS is not configured (`tls_cert_file`/`tls_key_file` are not set, or the certificate files are missing), the service exits immediately with an error message explaining how to fix it.
+
+For **development and testing only**, you can override this by setting `insecure_mode: true` in `config.yaml`:
+
+```yaml
+# WARNING: Development/testing only — never enable in production!
+insecure_mode: true
+```
+
+When insecure mode is enabled:
+
+- A **prominent warning banner** is printed at startup
+- A **security warning is logged every hour** as a persistent reminder
+- All traffic is transmitted in **unencrypted plaintext HTTP**
+
+To run the service securely, generate TLS certificates and remove (or set to `false`) the `insecure_mode` setting:
+
+```bash
+# Generate a self-signed certificate for development
+./setup_certs.sh --hostname localhost
+
+# Configure TLS in config.yaml
+# tls_cert_file: certs/server.crt
+# tls_key_file: certs/server.key
+```
+
+See [mTLS Setup Guide](#mtls-setup-guide) for production certificate setup.
 
 ## Authentication & Security
 
@@ -720,6 +763,10 @@ curl -X POST http://localhost:5000/curri \
 ## Production Deployment Checklist
 
 Use this checklist when moving from a development setup to a production deployment. Each item references the relevant section above for details.
+
+### Security mode
+
+- [ ] Ensure `insecure_mode` is **not set** (or set to `false`) in `config.yaml` — the service must run with TLS in production
 
 ### Certificates and mTLS
 

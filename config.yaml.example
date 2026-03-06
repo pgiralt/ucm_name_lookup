@@ -19,6 +19,26 @@
 # The LOG_LEVEL environment variable, if set, overrides the value here.
 # ===========================================================================
 
+# ---------------------------------------------------------------------------
+# Security Mode (IMPORTANT — read before first run)
+# ---------------------------------------------------------------------------
+#
+# This service is SECURE BY DEFAULT. It will NOT start unless TLS
+# certificates are configured (tls_cert_file and tls_key_file below,
+# or certs/server.crt and certs/server.key for Gunicorn).
+#
+# For development or testing without TLS, you must explicitly enable
+# insecure mode by uncommenting the line below and setting it to true.
+# When insecure_mode is enabled:
+#   - A prominent warning banner is displayed at startup.
+#   - A security warning is logged every hour.
+#   - All traffic is transmitted in unencrypted plaintext HTTP.
+#
+# NEVER enable insecure_mode in production. Use ./setup_certs.sh to
+# generate certificates for TLS/mTLS instead.
+#
+# insecure_mode: true
+
 # Path to the phone directory CSV file.
 csv_file_path: phone_directory.csv
 

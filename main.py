@@ -52,6 +52,7 @@ import logging.handlers
 import os
 import ssl
 import sys
+import threading
 from dataclasses import dataclass, field
 from xml.sax.saxutils import escape as xml_escape
 
@@ -119,6 +120,11 @@ LOG_LEVEL = os.environ.get(
     "LOG_LEVEL", _config.get("log_level", "INFO")
 ).upper()
 
+# Insecure mode flag. When True, the application is allowed to run
+# without TLS certificates (plain HTTP). When False (the default),
+# the application refuses to start unless TLS is properly configured.
+INSECURE_MODE = _config.get("insecure_mode", False) is True
+
 # Optional directory for rotating log files. When set, the application
 # writes log files here in addition to stdout/stderr.
 LOG_DIR = _config.get("log_dir")
@@ -163,6 +169,59 @@ if LOG_DIR:
     logging.root.addHandler(_file_handler)
 
 logger = logging.getLogger("ucm_name_lookup")
+
+# ---------------------------------------------------------------------------
+# Insecure Mode Warning
+# ---------------------------------------------------------------------------
+
+_INSECURE_BANNER = (
+    "\n"
+    "########################################################################\n"
+    "#                                                                      #\n"
+    "#                    WARNING: INSECURE MODE ENABLED                     #\n"
+    "#                                                                      #\n"
+    "#  This service is running WITHOUT TLS encryption. All traffic,         #\n"
+    "#  including CURRI requests and responses, is transmitted in plain      #\n"
+    "#  text and is vulnerable to eavesdropping and tampering.               #\n"
+    "#                                                                      #\n"
+    "#  This mode is intended for development and testing ONLY.              #\n"
+    "#  Do NOT use insecure mode in production.                              #\n"
+    "#                                                                      #\n"
+    "#  To enable TLS, configure tls_cert_file and tls_key_file in          #\n"
+    "#  config.yaml and set insecure_mode to false (or remove it).          #\n"
+    "#                                                                      #\n"
+    "########################################################################"
+)
+
+_INSECURE_HOURLY_MSG = (
+    "SECURITY WARNING: This service is running in INSECURE MODE without "
+    "TLS encryption. All traffic is unencrypted. Configure TLS certificates "
+    "and disable insecure_mode for production use."
+)
+
+_insecure_mode_timer: threading.Timer | None = None
+
+
+def _start_insecure_mode_warning() -> None:
+    """Start a repeating timer that logs an insecure mode warning every hour.
+
+    The timer runs as a daemon thread so it does not prevent the process
+    from exiting.
+    """
+    global _insecure_mode_timer
+
+    def _warn_and_reschedule() -> None:
+        logger.warning(_INSECURE_HOURLY_MSG)
+        _schedule_next()
+
+    def _schedule_next() -> None:
+        global _insecure_mode_timer
+        _insecure_mode_timer = threading.Timer(3600, _warn_and_reschedule)
+        _insecure_mode_timer.daemon = True
+        _insecure_mode_timer.start()
+
+    _schedule_next()
+
 
 # ---------------------------------------------------------------------------
 # UCM Cluster Definitions
@@ -1322,77 +1381,97 @@ if __name__ == "__main__":
     # Flask development server – use Gunicorn for production deployments.
     # -----------------------------------------------------------------------
     logger.info("Starting UCM Name Lookup CURRI server (development mode)")
-    logger.info("Listening on %s:%d", FLASK_HOST, FLASK_PORT)
     logger.info("CURRI endpoint: POST /curri")
     logger.info("Health check:   GET  /health")
 
     # Configure TLS if certificate and key files are provided.
     ssl_context = None
-    if TLS_CERT_FILE and TLS_KEY_FILE:
-        if os.path.isfile(TLS_CERT_FILE) and os.path.isfile(TLS_KEY_FILE):
-            # Build an SSLContext so we can optionally enable mTLS.
-            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
-            ssl_context.load_cert_chain(TLS_CERT_FILE, TLS_KEY_FILE)
+    _tls_configured = (
+        TLS_CERT_FILE
+        and TLS_KEY_FILE
+        and os.path.isfile(TLS_CERT_FILE)
+        and os.path.isfile(TLS_KEY_FILE)
+    )
+
+    if _tls_configured:
+        # Build an SSLContext so we can optionally enable mTLS.
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        ssl_context.load_cert_chain(TLS_CERT_FILE, TLS_KEY_FILE)
+        logger.info(
+            "TLS enabled with cert=%s key=%s", TLS_CERT_FILE, TLS_KEY_FILE
+        )
+
+        # --- Mutual TLS (mTLS) ---
+        # Load CA certificates from all clusters that define a
+        # ca_file. Each call to load_verify_locations() adds to
+        # the trust store, so clients from any configured cluster
+        # will be accepted at the TLS layer. Application-level
+        # cluster matching (IP + subject) provides further filtering.
+        ca_loaded = False
+        seen_ca_files: set[str] = set()
+        for cluster in CLUSTERS:
+            if cluster.ca_file:
+                if cluster.ca_file in seen_ca_files:
+                    continue
+                seen_ca_files.add(cluster.ca_file)
+                if os.path.isfile(cluster.ca_file):
+                    ssl_context.load_verify_locations(cluster.ca_file)
+                    ca_loaded = True
+                    logger.info(
+                        "Loaded CA for cluster '%s': %s",
+                        cluster.name,
+                        cluster.ca_file,
+                    )
+                else:
+                    logger.error(
+                        "CA file not found for cluster '%s': %s",
+                        cluster.name,
+                        cluster.ca_file,
+                    )
+                    sys.exit(1)
+
+        if ca_loaded:
+            ssl_context.verify_mode = ssl.CERT_REQUIRED
             logger.info(
-                "TLS enabled with cert=%s key=%s", TLS_CERT_FILE, TLS_KEY_FILE
+                "Mutual TLS enabled — client certificates are "
+                "required for all connections"
             )
-
-            # --- Mutual TLS (mTLS) ---
-            # Load CA certificates from all clusters that define a
-            # ca_file. Each call to load_verify_locations() adds to
-            # the trust store, so clients from any configured cluster
-            # will be accepted at the TLS layer. Application-level
-            # cluster matching (IP + subject) provides further filtering.
-            ca_loaded = False
-            seen_ca_files: set[str] = set()
-            for cluster in CLUSTERS:
-                if cluster.ca_file:
-                    if cluster.ca_file in seen_ca_files:
-                        continue
-                    seen_ca_files.add(cluster.ca_file)
-                    if os.path.isfile(cluster.ca_file):
-                        ssl_context.load_verify_locations(cluster.ca_file)
-                        ca_loaded = True
-                        logger.info(
-                            "Loaded CA for cluster '%s': %s",
-                            cluster.name,
-                            cluster.ca_file,
-                        )
-                    else:
-                        logger.error(
-                            "CA file not found for cluster '%s': %s",
-                            cluster.name,
-                            cluster.ca_file,
-                        )
-                        sys.exit(1)
-
-            if ca_loaded:
-                ssl_context.verify_mode = ssl.CERT_REQUIRED
-                logger.info(
-                    "Mutual TLS enabled — client certificates are "
-                    "required for all connections"
-                )
-                _log_trusted_ca_certs(ssl_context)
-            else:
-                logger.info(
-                    "Mutual TLS is not configured (no cluster defines "
-                    "ca_file). Client certificates will not be verified."
-                )
+            _log_trusted_ca_certs(ssl_context)
         else:
+            logger.info(
+                "Mutual TLS is not configured (no cluster defines "
+                "ca_file). Client certificates will not be verified."
+            )
+    elif TLS_CERT_FILE and TLS_KEY_FILE:
+        # Cert/key paths are configured but files are missing.
+        logger.error(
+            "TLS certificate or key file not found: cert=%s, key=%s",
+            TLS_CERT_FILE,
+            TLS_KEY_FILE,
+        )
+        sys.exit(1)
+    else:
+        # --- Secure by default: require insecure_mode to run without TLS ---
+        if not INSECURE_MODE:
             logger.error(
-                "TLS certificate or key file not found: cert=%s, key=%s",
-                TLS_CERT_FILE,
-                TLS_KEY_FILE,
+                "TLS is not configured and insecure_mode is not enabled. "
+                "The service requires TLS certificates to start. Either:\n"
+                "  1. Configure tls_cert_file and tls_key_file in %s\n"
+                "     (see: ./setup_certs.sh --hostname <your-host>)\n"
+                "  2. Set 'insecure_mode: true' in %s to allow plaintext "
+                "HTTP (development/testing only)",
+                CONFIG_FILE,
+                CONFIG_FILE,
             )
             sys.exit(1)
-    else:
-        logger.warning(
-            "TLS is not configured – running in plaintext HTTP mode. "
-            "Set tls_cert_file and tls_key_file in %s for HTTPS, or use "
-            "Gunicorn's --certfile / --keyfile options in production.",
-            CONFIG_FILE,
-        )
+
+        # Insecure mode explicitly enabled — warn loudly.
+        logger.warning(_INSECURE_BANNER)
+        logger.warning(_INSECURE_HOURLY_MSG)
+        _start_insecure_mode_warning()
+
+    logger.info("Listening on %s:%d", FLASK_HOST, FLASK_PORT)
 
     app.run(
         host=FLASK_HOST,
