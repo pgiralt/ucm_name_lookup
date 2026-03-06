@@ -1092,12 +1092,12 @@ def build_continue_response(display_name: str | None = None) -> str:
             "</cixml>"
         )
 
-        logger.info(
+        logger.debug(
             "Building continue response with display name: %s", display_name
         )
     else:
         cixml_raw = '<cixml ver="1.0"><continue></continue></cixml>'
-        logger.info("Building simple continue response (no name match)")
+        logger.debug("Building simple continue response (no name match)")
 
     # Step 3 – Entity-encode the CIXML for embedding inside the XACML
     #          <AttributeValue> text content. UCM will decode these
@@ -1157,7 +1157,7 @@ def lookup_display_name(calling_number: str) -> str | None:
     # --- 1. Try exact match first (O(1) dict lookup) ---
     display_name = exact_directory.get(normalized)
     if display_name:
-        logger.info(
+        logger.debug(
             "Exact match found: %s -> %s", calling_number, display_name
         )
         return display_name
@@ -1166,12 +1166,12 @@ def lookup_display_name(calling_number: str) -> str | None:
     if prefix_trie is not None:
         display_name = prefix_trie.longest_prefix_match(normalized)
         if display_name:
-            logger.info(
+            logger.debug(
                 "Prefix match found: %s -> %s", calling_number, display_name
             )
             return display_name
 
-    logger.info(
+    logger.debug(
         "No name match for number: %s (normalized: %s)",
         calling_number,
         normalized,
@@ -1238,7 +1238,7 @@ def curri_endpoint():
     called_number = attributes.get(CURRI_ATTR_CALLED_NUMBER, "unknown")
 
     if calling_number:
-        logger.info(
+        logger.debug(
             "Processing lookup: calling=%s, called=%s",
             calling_number,
             called_number,
