@@ -1,0 +1,6 @@
+phone_number,display_name,match_type
++12125551001,Alice Johnson,exact
++12125551002,Bob Smith,exact
++1212,New York City,prefix
++1312,Chicago,prefix
++1919476,"RTP, NC",prefix

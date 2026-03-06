@@ -1,0 +1,5 @@
+# Minimal test configuration — insecure mode so import succeeds without
+# TLS certificates or cluster definitions.
+insecure_mode: true
+csv_file_path: tests/fixtures/test_directory.csv
+log_level: WARNING

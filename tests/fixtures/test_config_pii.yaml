@@ -1,0 +1,5 @@
+# Test configuration with PII obfuscation enabled.
+insecure_mode: true
+csv_file_path: tests/fixtures/test_directory.csv
+log_level: WARNING
+obfuscate_pii: true
