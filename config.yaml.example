@@ -39,6 +39,21 @@
 #
 # insecure_mode: true
 
+# ---------------------------------------------------------------------------
+# PII Obfuscation
+# ---------------------------------------------------------------------------
+#
+# When enabled, phone numbers and display names are replaced with
+# truncated SHA-256 hashes in all log output. The format is:
+#
+#   {! <24-char-hex-hash> !}
+#
+# This allows operators to correlate repeated values (the same input
+# always produces the same hash) without exposing the actual data.
+# Useful for environments that must comply with privacy regulations.
+#
+# obfuscate_pii: true
+
 # Path to the phone directory CSV file.
 csv_file_path: phone_directory.csv
 

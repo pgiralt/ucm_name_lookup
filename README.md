@@ -71,6 +71,7 @@ cp config.yaml.example config.yaml
 | Setting | Default | Description |
 |---|---|---|
 | `insecure_mode` | `false` | When `true`, allows the service to start without TLS (see [Secure by Default](#secure-by-default)) |
+| `obfuscate_pii` | `false` | When `true`, phone numbers and display names are hashed in log output (see [PII Obfuscation](#pii-obfuscation)) |
 | `csv_file_path` | `phone_directory.csv` | Path to the phone directory CSV file |
 | `log_level` | `INFO` | Logging level: DEBUG, INFO, WARNING, ERROR |
 | `log_dir` | *(none)* | Directory for rotating log files (see [Logging](#logging)) |
@@ -181,6 +182,26 @@ To run the service securely, generate TLS certificates and remove (or set to `fa
 ```
 
 See [mTLS Setup Guide](#mtls-setup-guide) for production certificate setup.
+
+## PII Obfuscation
+
+For environments that must comply with privacy regulations (e.g. GDPR), the service can obfuscate personally identifiable information in log output. When `obfuscate_pii: true` is set in `config.yaml`, all phone numbers and display names are replaced with a truncated SHA-256 hash:
+
+```
+# Normal logging
+Exact match found: +12125551212 -> John Doe
+
+# With obfuscate_pii: true
+Exact match found: {! 9f86d081884c7d659a2f !} -> {! a591a6d40bf420404a01 !}
+```
+
+The same input always produces the same hash, so operators can still correlate repeated values across log entries without seeing the actual data. The hash is the first 24 hex characters of the SHA-256 digest, wrapped in `{! … !}` delimiters for easy identification.
+
+To enable:
+
+```yaml
+obfuscate_pii: true
+```
 
 ## Authentication & Security
 

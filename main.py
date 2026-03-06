@@ -46,6 +46,7 @@ Environment Variables:
 """
 
 import csv
+import hashlib
 import ipaddress
 import logging
 import logging.handlers
@@ -125,6 +126,29 @@ LOG_LEVEL = os.environ.get(
 # the application refuses to start unless TLS is properly configured.
 INSECURE_MODE = _config.get("insecure_mode", False) is True
 
+# PII obfuscation flag. When True, phone numbers and display names are
+# replaced with a SHA-256 hash in log output so that operators can
+# correlate identical values without seeing the actual data.
+OBFUSCATE_PII = _config.get("obfuscate_pii", False) is True
+
+
+def _obfuscate_pii(value: str | None) -> str | None:
+    """Return a privacy-safe representation of *value* for logging.
+
+    When ``OBFUSCATE_PII`` is enabled, the value is hashed with SHA-256
+    and the first 24 hex characters are returned wrapped in ``{! … !}``
+    delimiters. This allows log readers to recognise when two values
+    are identical without revealing the underlying data.
+
+    When obfuscation is disabled the original value is returned unchanged.
+    ``None`` and empty strings are passed through as-is.
+    """
+    if not OBFUSCATE_PII or not value:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+    return f"{{! {digest} !}}"
+
+
 # Optional directory for rotating log files. When set, the application
 # writes log files here in addition to stdout/stderr.
 LOG_DIR = _config.get("log_dir")
@@ -178,14 +202,14 @@ _INSECURE_BANNER = (
     "\n"
     "########################################################################\n"
     "#                                                                      #\n"
-    "#                    WARNING: INSECURE MODE ENABLED                     #\n"
+    "#                    WARNING: INSECURE MODE ENABLED                    #\n"
     "#                                                                      #\n"
-    "#  This service is running WITHOUT TLS encryption. All traffic,         #\n"
-    "#  including CURRI requests and responses, is transmitted in plain      #\n"
-    "#  text and is vulnerable to eavesdropping and tampering.               #\n"
+    "#  This service is running WITHOUT TLS encryption. All traffic,        #\n"
+    "#  including CURRI requests and responses, is transmitted in plain     #\n"
+    "#  text and is vulnerable to eavesdropping and tampering.              #\n"
     "#                                                                      #\n"
-    "#  This mode is intended for development and testing ONLY.              #\n"
-    "#  Do NOT use insecure mode in production.                              #\n"
+    "#  This mode is intended for development and testing ONLY.             #\n"
+    "#  Do NOT use insecure mode in production.                             #\n"
     "#                                                                      #\n"
     "#  To enable TLS, configure tls_cert_file and tls_key_file in          #\n"
     "#  config.yaml and set insecure_mode to false (or remove it).          #\n"
@@ -447,6 +471,12 @@ else:
         "subject validation are DISABLED. All clients can reach "
         "the /curri endpoint. Define clusters in %s to restrict access.",
         CONFIG_FILE,
+    )
+
+if OBFUSCATE_PII:
+    logger.info(
+        "PII obfuscation is ENABLED — phone numbers and display names "
+        "will appear as SHA-256 hashes in log output"
     )
 
 
@@ -969,7 +999,9 @@ def load_phone_directory(
 
                 if not phone or not name:
                     logger.warning(
-                        "Skipping invalid CSV row (empty phone or name): %s", row
+                        "Skipping invalid CSV row (empty phone or name): %s",
+                        {k: _obfuscate_pii(v) for k, v in row.items()}
+                        if OBFUSCATE_PII else row,
                     )
                     continue
 
@@ -978,7 +1010,8 @@ def load_phone_directory(
                         "Skipping CSV row with invalid match_type '%s' "
                         "(expected 'exact' or 'prefix'): %s",
                         match_type,
-                        row,
+                        {k: _obfuscate_pii(v) for k, v in row.items()}
+                        if OBFUSCATE_PII else row,
                     )
                     continue
 
@@ -1081,7 +1114,7 @@ def parse_xacml_request(xml_data: bytes) -> dict[str, str]:
                 logger.debug(
                     "Parsed XACML attribute: %s = %s",
                     attr_id,
-                    attributes[attr_id],
+                    _obfuscate_pii(attributes[attr_id]),
                 )
 
     return attributes
@@ -1104,7 +1137,8 @@ def get_calling_number(attributes: dict[str, str]) -> str | None:
         calling_number = attributes.get(CURRI_ATTR_TRANSFORMED_CGPN)
         if calling_number:
             logger.debug(
-                "Using transformedcgpn as calling number: %s", calling_number
+                "Using transformedcgpn as calling number: %s",
+                _obfuscate_pii(calling_number),
             )
     return calling_number
 
@@ -1162,7 +1196,8 @@ def build_continue_response(display_name: str | None = None) -> str:
         )
 
         logger.info(
-            "Building continue response with display name: %s", display_name
+            "Building continue response with display name: %s",
+            _obfuscate_pii(display_name),
         )
     else:
         cixml_raw = '<cixml ver="1.0"><continue></continue></cixml>'
@@ -1227,7 +1262,9 @@ def lookup_display_name(calling_number: str) -> str | None:
     display_name = exact_directory.get(normalized)
     if display_name:
         logger.info(
-            "Exact match found: %s -> %s", calling_number, display_name
+            "Exact match found: %s -> %s",
+            _obfuscate_pii(calling_number),
+            _obfuscate_pii(display_name),
         )
         return display_name
 
@@ -1236,14 +1273,16 @@ def lookup_display_name(calling_number: str) -> str | None:
         display_name = prefix_trie.longest_prefix_match(normalized)
         if display_name:
             logger.info(
-                "Prefix match found: %s -> %s", calling_number, display_name
+                "Prefix match found: %s -> %s",
+                _obfuscate_pii(calling_number),
+                _obfuscate_pii(display_name),
             )
             return display_name
 
     logger.info(
         "No name match for number: %s (normalized: %s)",
-        calling_number,
-        normalized,
+        _obfuscate_pii(calling_number),
+        _obfuscate_pii(normalized),
     )
     return None
 
@@ -1294,10 +1333,15 @@ def curri_endpoint():
             content_type='text/xml; charset="utf-8"',
         )
 
-    logger.debug(
-        "Raw XACML request body:\n%s",
-        xml_data.decode("utf-8", errors="replace"),
-    )
+    if OBFUSCATE_PII:
+        logger.debug(
+            "Raw XACML request body suppressed (obfuscate_pii is enabled)"
+        )
+    else:
+        logger.debug(
+            "Raw XACML request body:\n%s",
+            xml_data.decode("utf-8", errors="replace"),
+        )
 
     # --- Parse the XACML request to extract call attributes ---
     attributes = parse_xacml_request(xml_data)
@@ -1309,8 +1353,8 @@ def curri_endpoint():
     if calling_number:
         logger.info(
             "Processing lookup: calling=%s, called=%s",
-            calling_number,
-            called_number,
+            _obfuscate_pii(calling_number),
+            _obfuscate_pii(called_number),
         )
         # Look up the display name for the calling number.
         display_name = lookup_display_name(calling_number)

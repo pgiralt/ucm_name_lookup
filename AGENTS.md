@@ -37,7 +37,7 @@ A **CURRI** (Cisco Unified Routing Rules Interface) server that provides phone n
 
 All application logic lives in `main.py`. This is intentional for simplicity given the service's focused scope. The file is organized in clear sections with separator comments:
 
-1. **Configuration** — YAML loading, global settings, insecure mode flag
+1. **Configuration** — YAML loading, global settings, insecure mode flag, PII obfuscation flag and helper
 2. **Insecure Mode Warning** — banner constant, hourly warning timer
 3. **Cluster Definitions** — `ClusterConfig` dataclass, parsing helpers
 4. **CA Bundle Generation** — auto-concatenation of cluster CA files
@@ -89,6 +89,10 @@ When `insecure_mode` is enabled:
 
 The `insecure_mode` config value defaults to `false`. The check uses `_config.get("insecure_mode", False) is True` to ensure only an explicit boolean `true` enables it.
 
+### PII obfuscation
+
+When `obfuscate_pii: true` is set in `config.yaml`, phone numbers and display names are replaced with truncated SHA-256 hashes in all log output. The format is `{! <24-char-hex> !}`. The `_obfuscate_pii()` helper returns the original value when disabled or the hash when enabled. This covers CSV loading warnings, XACML attribute parsing, phone number lookup results, and the CURRI request processing log line.
+
 ### CA bundle auto-generation
 
 When `ca_bundle_path` is set in config, the app concatenates all unique cluster `ca_file` entries into a single PEM bundle at startup. This file is what Gunicorn's `--ca-certs` should point to.
@@ -131,6 +135,7 @@ Numbers are normalized (strip formatting chars, preserve leading `+`) before loo
 - **`defusedxml` for all XML parsing** — prevents XXE attacks
 - **`yaml.safe_load` only** — prevents unsafe deserialization
 - **No secrets in config.yaml** — TLS keys go through Gunicorn CLI or file mounts
+- **PII obfuscation** — when `obfuscate_pii: true` is set, all phone numbers and display names are logged as `{! SHA-256-prefix !}` via the `_obfuscate_pii()` helper. Use this helper for any new log statements that include caller/callee data
 - **Logging**: use the `ucm_name_lookup` logger; never log secrets, tokens, or raw cert data
 - **File logging**: when `log_dir` is set in config, `ConcurrentRotatingFileHandler` (from `concurrent-log-handler`) writes `app.log`, and Gunicorn's `logconfig_dict` writes `access.log` + `error.log` — all with file-locked rotation safe for multiple Gunicorn workers
 - **Security headers**: `@app.after_request` sets `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Cache-Control: no-store`, `Content-Security-Policy: default-src 'none'`, and strips the `Server` header
