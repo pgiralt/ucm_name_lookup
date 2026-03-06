@@ -243,21 +243,11 @@ No `GUNICORN_CMD_ARGS` needed — `gunicorn.conf.py` reads `config.yaml` and aut
 
 ### Application-Layer Certificate Verification
 
-Because the TLS layer accepts any client certificate signed by *any* CA in the combined bundle, the application adds a **per-cluster certificate check** at request time. The behavior adapts automatically based on the type of certificate in `ca_file`:
+Because the TLS layer accepts any client certificate signed by *any* CA in the combined bundle, the application adds a **per-cluster certificate check** at request time. It compares the client certificate's **issuer** against the CA's subject — verifying the client cert was signed by this specific CA.
 
-- **CA certificate** (`CA:TRUE`, e.g. default self-signed UCM cert): the application compares the client certificate's **issuer** against the CA's subject — verifying the client cert was signed by this specific CA.
-- **Leaf certificate** (`CA:FALSE`, e.g. CA-signed UCM cert from a public or enterprise CA): the application uses **SHA-256 fingerprint pinning** — it computes the hash of the client certificate's DER encoding and compares it (constant-time) against the pre-computed hash of the stored certificate. This proves the client presented the *exact same certificate*, not merely one with the same subject name. An attacker cannot bypass this by generating their own certificate with matching subject fields.
+This happens automatically whenever `ca_file` is set for a cluster. No additional configuration is needed.
 
-This happens automatically whenever `ca_file` is set for a cluster. No additional configuration is needed. The application detects the certificate type at startup and logs which verification mode is active (including the first 16 hex characters of the pinned fingerprint).
-
-### TLS Client Certificate Mode (CERT_REQUIRED vs CERT_OPTIONAL)
-
-At startup, `gunicorn.conf.py` (and the dev server) probes the CA bundle to determine whether it contains real CA certificates or only leaf certificates:
-
-- **CA certificates in bundle → `CERT_REQUIRED`**: OpenSSL enforces full chain verification at the TLS layer. Connections without a valid client certificate are rejected before reaching the application.
-- **Leaf-only bundle → `CERT_OPTIONAL`**: OpenSSL cannot use a leaf certificate as a trust anchor, so `CERT_OPTIONAL` is used instead. The TLS handshake completes even without a client certificate. The **application layer** handles identity verification via SHA-256 fingerprint pinning. Under `CERT_OPTIONAL`, `getpeercert()` returns an empty dict (chain can't verify), so the application uses `getpeercert(binary_form=True)` to obtain the raw DER bytes for fingerprinting and decoding.
-
-This auto-detection is transparent — no configuration change is needed. The mode is logged at startup.
+> **Important:** The `ca_file` must be a **CA certificate** (`CA:TRUE`), not the UCM's identity/leaf certificate. If a leaf certificate is detected at startup, the application exits with an error. The CA certificate is typically the one that signed the UCM's `CallManager.pem` — you can export it from UCM OS Administration under **Security > Certificate Management**. For UCM clusters using certificates signed by a public or enterprise CA, provide the issuing CA's certificate (or the intermediate CA certificate).
 
 ### Certificate Subject Validation (CN/SAN)
 

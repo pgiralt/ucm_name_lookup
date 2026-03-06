@@ -4,11 +4,9 @@ Behavior depends on the TLS / mTLS configuration detected from
 ``config.yaml``:
 
 * **HTTP or HTTPS (no mTLS)** — probes ``/health`` via HTTP(S).
-* **HTTPS + leaf-only CA bundle (CERT_OPTIONAL)** — probes ``/health``
-  via HTTPS (the TLS handshake succeeds without a client certificate).
-* **mTLS with real CA certs (CERT_REQUIRED)** — verifies that Gunicorn
-  worker processes are alive via ``/proc``, since the TLS layer rejects
-  connections without a client certificate.
+* **mTLS (CERT_REQUIRED)** — verifies that Gunicorn worker processes
+  are alive via ``/proc``, since the TLS layer rejects connections
+  without a valid client certificate.
 """
 
 import os
@@ -25,32 +23,20 @@ if os.path.isfile(config_path):
 
 cert = config.get("tls_cert_file", "certs/server.crt")
 key = config.get("tls_key_file", "certs/server.key")
-ca_bundle_path = config.get("ca_bundle_path", "")
 clusters = config.get("clusters", {})
 
 tls_enabled = os.path.isfile(cert) and os.path.isfile(key)
 
-# Determine if strict mTLS (CERT_REQUIRED) is active. This is only
-# the case when the CA bundle contains real CA certificates. When
-# the bundle has only leaf certificates, Gunicorn uses CERT_OPTIONAL
-# and the HTTP health check works without a client cert.
-cert_required = False
-if tls_enabled and ca_bundle_path:
-    _bundle_exists = os.path.isfile(ca_bundle_path)
-    if not _bundle_exists and isinstance(clusters, dict):
-        for cdata in clusters.values():
-            if isinstance(cdata, dict) and cdata.get("ca_file"):
-                if os.path.isfile(cdata["ca_file"]):
-                    _bundle_exists = True
-                    break
-    if _bundle_exists:
-        # Check whether the bundle has real CA certs (not just leaves).
-        try:
-            _ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            _ctx.load_verify_locations(ca_bundle_path)
-            cert_required = bool(_ctx.get_ca_certs())
-        except (ssl.SSLError, OSError):
-            pass
+# mTLS is active when TLS is enabled and at least one cluster
+# defines a ca_file. In that case Gunicorn uses CERT_REQUIRED
+# and the health check cannot connect without a client certificate,
+# so we fall back to a process-level check.
+mtls_enabled = False
+if tls_enabled and isinstance(clusters, dict):
+    for cdata in clusters.values():
+        if isinstance(cdata, dict) and cdata.get("ca_file"):
+            mtls_enabled = True
+            break
 
 
 def _check_http():
@@ -92,7 +78,7 @@ def _check_process():
     sys.exit(1)
 
 
-if cert_required:
+if mtls_enabled:
     _check_process()
 else:
     _check_http()

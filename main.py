@@ -46,8 +46,6 @@ Environment Variables:
 """
 
 import csv
-import hashlib
-import hmac
 import ipaddress
 import logging
 import os
@@ -167,41 +165,32 @@ class ClusterConfig:
     allowed_subjects: set[str] = field(default_factory=set)
     ca_file: str | None = None
     ca_subject: tuple | None = None
-    ca_is_leaf: bool = False
-    ca_fingerprint: str | None = None
 
 
 def _load_ca_subject(
     ca_file: str, cluster_name: str
-) -> tuple[tuple | None, bool, str | None]:
-    """Load a certificate and return its ``subject`` tuple, type, and
-    optional SHA-256 fingerprint.
+) -> tuple | None:
+    """Load a CA certificate and return its ``subject`` tuple.
 
     The returned tuple uses the same nested-tuple format as
     :meth:`ssl.SSLSocket.getpeercert` so that it can be directly
-    compared with a client certificate at request time.
+    compared with a client certificate's ``issuer`` at request time.
 
-    For CA certificates (``CA:TRUE``), the subject is compared against
-    the client certificate's ``issuer`` field — verifying the client
-    cert was signed by this CA. No fingerprint is returned (the TLS
-    layer handles chain verification via ``CERT_REQUIRED``).
+    The file **must** contain a CA certificate (``CA:TRUE``). If a
+    leaf certificate is detected instead, an error is logged and the
+    application exits — the user must provide the CA certificate that
+    signed the UCM's identity certificate, not the identity
+    certificate itself.
 
-    For leaf certificates (``CA:FALSE``, e.g. a CA-signed UCM cert),
-    a SHA-256 fingerprint of the DER-encoded certificate is computed
-    and returned. At request time the client certificate's DER bytes
-    are hashed and compared — proving the *exact same certificate*
-    was presented, not merely one with the same subject name.
-
-    Returns ``(subject_tuple, is_leaf, fingerprint)`` or
-    ``(None, False, None)``.
+    Returns the ``subject`` tuple or ``None``.
     """
-    # --- Try loading as a CA certificate first ---
+    # --- Try loading as a CA certificate ---
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.load_verify_locations(ca_file)
         ca_certs = ctx.get_ca_certs()
         if ca_certs:
-            return ca_certs[0].get("subject"), False, None
+            return ca_certs[0].get("subject")
     except (ssl.SSLError, OSError) as exc:
         logger.error(
             "Cluster '%s': failed to load CA file '%s': %s",
@@ -209,40 +198,23 @@ def _load_ca_subject(
             ca_file,
             exc,
         )
-        return None, False, None
+        return None
 
-    # --- Fallback: parse as a leaf certificate ---
+    # --- Detect leaf certificate and give a clear error ---
     try:
         cert_dict = ssl._ssl._test_decode_cert(ca_file)  # noqa: SLF001
-        if cert_dict:
-            subject = cert_dict.get("subject")
-            if subject:
-                # Compute SHA-256 fingerprint of the DER encoding.
-                # This is used at request time for exact certificate
-                # matching — an attacker cannot forge this without
-                # possessing the identical certificate bytes.
-                fingerprint = None
-                try:
-                    with open(ca_file, "r", encoding="utf-8") as fh:
-                        pem_data = fh.read()
-                    der_bytes = ssl.PEM_cert_to_DER_cert(pem_data)
-                    fingerprint = hashlib.sha256(der_bytes).hexdigest()
-                except Exception as exc:
-                    logger.warning(
-                        "Cluster '%s': could not compute fingerprint "
-                        "for '%s': %s",
-                        cluster_name,
-                        ca_file,
-                        exc,
-                    )
-                logger.info(
-                    "Cluster '%s': '%s' is a leaf certificate "
-                    "(not a CA). Client certificate identity "
-                    "will be verified by SHA-256 fingerprint.",
-                    cluster_name,
-                    ca_file,
-                )
-                return subject, True, fingerprint
+        if cert_dict and cert_dict.get("subject"):
+            logger.error(
+                "Cluster '%s': '%s' is a leaf certificate (not a CA). "
+                "The ca_file must be the CA certificate that signed "
+                "the UCM's identity certificate — not the identity "
+                "certificate itself. You can usually export the CA "
+                "cert from UCM OS Administration under "
+                "Security > Certificate Management.",
+                cluster_name,
+                ca_file,
+            )
+            sys.exit(1)
     except Exception as exc:
         logger.warning(
             "Cluster '%s': could not parse certificate '%s': %s",
@@ -256,7 +228,7 @@ def _load_ca_subject(
         cluster_name,
         ca_file,
     )
-    return None, False, None
+    return None
 
 
 def _parse_network_list(
@@ -329,14 +301,10 @@ def _parse_clusters(raw_clusters: dict) -> list[ClusterConfig]:
         )
         ca_file = cfg.get("ca_file")
         ca_subject = None
-        ca_is_leaf = False
-        ca_fingerprint = None
         if ca_file is not None:
             ca_file = str(ca_file)
             if os.path.isfile(ca_file):
-                ca_subject, ca_is_leaf, ca_fingerprint = (
-                    _load_ca_subject(ca_file, str(name))
-                )
+                ca_subject = _load_ca_subject(ca_file, str(name))
             else:
                 logger.error(
                     "Cluster '%s': CA file not found: %s", name, ca_file
@@ -350,8 +318,6 @@ def _parse_clusters(raw_clusters: dict) -> list[ClusterConfig]:
                 allowed_subjects=subjects,
                 ca_file=ca_file,
                 ca_subject=ca_subject,
-                ca_is_leaf=ca_is_leaf,
-                ca_fingerprint=ca_fingerprint,
             )
         )
     return clusters
@@ -377,21 +343,9 @@ if CLUSTERS:
         if _cl.ca_file:
             _parts.append(f"CA: {_cl.ca_file}")
         if _cl.ca_subject:
-            if _cl.ca_is_leaf:
-                if _cl.ca_fingerprint:
-                    _parts.append(
-                        "app-layer cert verification: SHA-256 "
-                        f"fingerprint pinning ({_cl.ca_fingerprint[:16]}…)"
-                    )
-                else:
-                    _parts.append(
-                        "app-layer cert identity verification: enabled "
-                        "(leaf certificate, NO fingerprint — degraded)"
-                    )
-            else:
-                _parts.append(
-                    "app-layer CA issuer verification: enabled"
-                )
+            _parts.append(
+                "app-layer CA issuer verification: enabled"
+            )
         logger.info(
             "Cluster '%s' — %s",
             _cl.name,
@@ -646,12 +600,7 @@ def _get_peer_certificate() -> dict | None:
 
     Returns the certificate dictionary from
     :meth:`ssl.SSLSocket.getpeercert`, or ``None`` if no
-    **verified** certificate is available.
-
-    .. note::
-       Under ``CERT_OPTIONAL`` with a leaf-only trust store, chain
-       verification fails and ``getpeercert()`` returns an empty dict.
-       Use :func:`_get_peer_certificate_der` instead.
+    verified certificate is available.
     """
     sock = _get_ssl_socket()
     if sock is not None:
@@ -659,45 +608,6 @@ def _get_peer_certificate() -> dict | None:
         if cert:
             return cert
     return None
-
-
-def _get_peer_certificate_der() -> bytes | None:
-    """Extract the DER-encoded peer (client) certificate.
-
-    Unlike :func:`_get_peer_certificate`, this returns the raw
-    certificate bytes even when chain verification has failed
-    (``CERT_OPTIONAL`` with a leaf-only trust store). This is
-    essential for fingerprint-based certificate pinning.
-
-    Returns ``None`` if the peer did not present a certificate.
-    """
-    sock = _get_ssl_socket()
-    if sock is not None:
-        der = sock.getpeercert(binary_form=True)
-        if der:
-            return der
-    return None
-
-
-def _decode_der_cert(der_bytes: bytes) -> dict | None:
-    """Decode DER-encoded certificate bytes into a parsed dict.
-
-    Uses a temporary PEM file and :func:`ssl._ssl._test_decode_cert`
-    to produce the same dictionary format as
-    :meth:`ssl.SSLSocket.getpeercert`.
-
-    Returns ``None`` if decoding fails.
-    """
-    try:
-        pem = ssl.DER_cert_to_PEM_cert(der_bytes)
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".pem", delete=True
-        ) as tmp:
-            tmp.write(pem)
-            tmp.flush()
-            return ssl._ssl._test_decode_cert(tmp.name)  # noqa: SLF001
-    except Exception:
-        return None
 
 
 def _get_cert_subjects(cert: dict) -> set[str]:
@@ -789,41 +699,12 @@ def _enforce_cluster_access():
     need_cert = any(
         c.allowed_subjects or c.ca_subject for c in CLUSTERS
     )
-    need_fingerprint = any(c.ca_fingerprint for c in CLUSTERS)
-
     cert: dict | None = None
     cert_subjects: set[str] | None = None
-    cert_der: bytes | None = None
-    cert_fingerprint: str | None = None
-
-    if need_cert or need_fingerprint:
-        # Try the parsed cert first (works when CERT_REQUIRED and the
-        # chain verifies against a real CA in the trust store).
+    if need_cert:
         cert = _get_peer_certificate()
-
-        # For leaf-cert clusters we also need the raw DER bytes.
-        # Under CERT_OPTIONAL with a leaf-only trust store,
-        # getpeercert() returns {} (chain cannot verify), but
-        # getpeercert(binary_form=True) still returns the DER.
-        if need_fingerprint:
-            cert_der = _get_peer_certificate_der()
-            if cert_der:
-                cert_fingerprint = hashlib.sha256(
-                    cert_der
-                ).hexdigest()
-                # If the parsed cert was empty (CERT_OPTIONAL),
-                # decode from DER so we have subject/SAN for the
-                # allowed_subjects check and for logging.
-                if not cert:
-                    cert = _decode_der_cert(cert_der)
-
         if cert:
             _log_cert_details(cert, "Client")
-            if cert_fingerprint:
-                logger.debug(
-                    "Client cert SHA-256 fingerprint: %s",
-                    cert_fingerprint,
-                )
         else:
             logger.debug(
                 "No client certificate available for request from %s",
@@ -862,76 +743,25 @@ def _enforce_cluster_access():
                 )
                 continue
 
-        # 3. Certificate verification (application-layer)
+        # 3. CA issuer verification (application-layer)
+        #    Ensures a client cert signed by cluster B's CA cannot
+        #    authorize a request as cluster A.
         if cluster.ca_subject:
-            if cluster.ca_is_leaf:
-                # --- Leaf cert: SHA-256 fingerprint pinning ---
-                # Proves the client presented the *exact* certificate
-                # we have on file, not merely one with the same
-                # subject name.
-                if cluster.ca_fingerprint:
-                    if cert_fingerprint is None:
-                        logger.debug(
-                            "Cluster '%s': fingerprint verification "
-                            "required but no client certificate DER "
-                            "is available",
-                            cluster.name,
-                        )
-                        continue
-                    if not hmac.compare_digest(
-                        cert_fingerprint, cluster.ca_fingerprint
-                    ):
-                        logger.debug(
-                            "Cluster '%s': client cert fingerprint "
-                            "%s does not match stored fingerprint "
-                            "%s",
-                            cluster.name,
-                            cert_fingerprint[:16] + "…",
-                            cluster.ca_fingerprint[:16] + "…",
-                        )
-                        continue
-                    logger.debug(
-                        "Cluster '%s': client cert fingerprint "
-                        "matches stored leaf certificate",
-                        cluster.name,
-                    )
-                else:
-                    # Fingerprint unavailable (should not happen in
-                    # normal operation) — fall back to subject match.
-                    if cert is None:
-                        logger.debug(
-                            "Cluster '%s': certificate verification "
-                            "required but client certificate is not "
-                            "accessible",
-                            cluster.name,
-                        )
-                        continue
-                    if cert.get("subject") != cluster.ca_subject:
-                        logger.debug(
-                            "Cluster '%s': client cert subject does "
-                            "not match expected leaf certificate "
-                            "identity (degraded — no fingerprint)",
-                            cluster.name,
-                        )
-                        continue
-            else:
-                # --- CA cert: issuer match ---
-                if cert is None:
-                    logger.debug(
-                        "Cluster '%s': certificate verification "
-                        "required but client certificate is not "
-                        "accessible",
-                        cluster.name,
-                    )
-                    continue
-                cert_issuer = cert.get("issuer")
-                if cert_issuer != cluster.ca_subject:
-                    logger.debug(
-                        "Cluster '%s': cert issuer does not match "
-                        "cluster CA subject",
-                        cluster.name,
-                    )
-                    continue
+            if cert is None:
+                logger.debug(
+                    "Cluster '%s': certificate verification required "
+                    "but client certificate is not accessible",
+                    cluster.name,
+                )
+                continue
+            cert_issuer = cert.get("issuer")
+            if cert_issuer != cluster.ca_subject:
+                logger.debug(
+                    "Cluster '%s': cert issuer does not match "
+                    "cluster CA subject",
+                    cluster.name,
+                )
+                continue
 
         # All defined rules passed — request is authorized.
         logger.debug(
@@ -1567,25 +1397,11 @@ if __name__ == "__main__":
                         sys.exit(1)
 
             if ca_loaded:
-                # Check whether the trust store has real CA certs.
-                # If only leaf certs are present, use CERT_OPTIONAL so
-                # the TLS handshake completes — the app layer handles
-                # certificate identity verification via subject match.
-                _has_ca = bool(ssl_context.get_ca_certs())
-                if _has_ca:
-                    ssl_context.verify_mode = ssl.CERT_REQUIRED
-                    logger.info(
-                        "Mutual TLS enabled — client certificates are "
-                        "required for all connections"
-                    )
-                else:
-                    ssl_context.verify_mode = ssl.CERT_OPTIONAL
-                    logger.info(
-                        "CA bundle contains only leaf certificates — "
-                        "using CERT_OPTIONAL. Client certificate "
-                        "verification will be handled at the "
-                        "application layer."
-                    )
+                ssl_context.verify_mode = ssl.CERT_REQUIRED
+                logger.info(
+                    "Mutual TLS enabled — client certificates are "
+                    "required for all connections"
+                )
                 _log_trusted_ca_certs(ssl_context)
             else:
                 logger.info(
