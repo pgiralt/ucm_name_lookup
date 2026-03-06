@@ -183,33 +183,58 @@ Both options accept these flags:
 > ```
 > The script auto-detects IP addresses and sets the SAN accordingly.
 
-#### Step 2 — Export UCM's CA certificate
+#### Step 2 — Obtain the root CA certificate that signed UCM's certificate
 
-Each UCM cluster has its own CA certificate that signs client certificates presented during mTLS.
+This service needs the **root CA certificate** that anchors UCM's client certificate chain. The correct file depends on how your UCM cluster's certificates were signed:
+
+**Self-signed UCM cluster (default):**
+
+When UCM uses its built-in self-signed certificates, `CallManager.pem` *is* the root CA:
 
 1. Open **Cisco Unified OS Administration** on the UCM publisher.
 2. Navigate to **Security > Certificate Management**.
 3. Click **Find**, then download the **CallManager.pem** certificate.
-4. Save it to your `certs/` directory with a descriptive name:
+4. Save it to your `certs/` directory:
    ```bash
-   # Example for a single cluster
-   cp ~/Downloads/CallManager.pem certs/ucm-CallManager.pem
-
-   # Example with multiple clusters
-   cp ~/Downloads/CallManager-HQ.pem  certs/hq-CallManager.pem
-   cp ~/Downloads/CallManager-BR.pem  certs/branch-CallManager.pem
+   cp ~/Downloads/CallManager.pem certs/ucm-ca.pem
    ```
+
+**CA-signed UCM cluster (enterprise or public CA):**
+
+When UCM's certificates are signed by an enterprise or public Certificate Authority, you need the **root CA certificate** from that CA — not the `CallManager.pem` exported from UCM:
+
+1. Obtain the root CA certificate from your Certificate Authority. For example:
+   - **Enterprise CA (Active Directory CS):** Export the root certificate from the CA server or download it from the CA's web enrollment page.
+   - **Public CA (e.g., HydrantID, DigiCert):** Download the root certificate from the CA's repository.
+2. If there are intermediate CA certificates in the chain, include the full chain (root + intermediates) in a single PEM file.
+3. Save the root CA certificate to your `certs/` directory:
+   ```bash
+   cp ~/Downloads/enterprise-root-ca.pem certs/ucm-ca.pem
+   ```
+
+> **How to check:** Open `CallManager.pem` and compare the **Subject** and **Issuer** fields. If they are identical, the certificate is self-signed and can be used directly. If they differ, the **Issuer** identifies the CA that signed it — obtain that CA's root certificate instead.
+>
+> ```bash
+> openssl x509 -in CallManager.pem -noout -subject -issuer
+> ```
+
+**Multiple clusters** with different CAs:
+
+```bash
+# Each cluster gets its own root CA file
+cp ~/Downloads/hq-root-ca.pem     certs/hq-ca.pem
+cp ~/Downloads/branch-root-ca.pem certs/branch-ca.pem
+```
 
 #### Step 3 — Upload the server certificate to UCM
 
 Upload this service's TLS certificate (`certs/server.crt`) into UCM so it trusts connections from this server:
 
-1. Open **Cisco Unified OS Administration** on each UCM node.
+1. Open **Cisco Unified OS Administration** on the UCM **publisher**.
 2. Navigate to **Security > Certificate Management > Upload Certificate**.
 3. Set **Certificate Purpose** to **CallManager-trust**.
 4. Upload `certs/server.crt`.
-5. **Repeat for every UCM node** in the cluster (publisher and all subscribers).
-6. Restart the **Cisco CallManager** service on each node for the change to take effect.
+5. The publisher automatically distributes trust certificates to all subscriber nodes. No service restart is required.
 
 #### Step 4 — Configure config.yaml
 
@@ -471,14 +496,163 @@ docker compose up -d
 
 ## UCM Configuration
 
-1. In Cisco Unified CM Administration, navigate to **Call Routing > External Call Control Profile**.
-2. Create a new profile with the **Primary Route Server URI** set to:
+This section covers everything that must be configured on the Cisco Unified Communications Manager side. The steps assume you have already deployed this service and it is reachable from the UCM nodes over the network.
+
+> **Prerequisite:** CURRI / External Call Control requires CUCM 8.5 or later. All examples below use the Cisco Unified CM Administration web interface.
+
+### Step 1 — Certificate exchange (mTLS only)
+
+If you are using mTLS (recommended for production), certificates must be exchanged between UCM and this service before ECC will work. If you are running without TLS (lab/testing), skip to [Step 2](#step-2--create-the-external-call-control-profile).
+
+The full certificate procedure is documented in the [mTLS Setup Guide](#mtls-setup-guide) above. In summary:
+
+1. **Obtain the root CA certificate for your UCM cluster:**
+   - **Self-signed UCM (default):** Export **CallManager.pem** from **Cisco Unified OS Administration > Security > Certificate Management** on the publisher. This file is both the UCM identity certificate and the root CA.
+   - **CA-signed UCM:** Obtain the **root CA certificate** from the Certificate Authority that signed UCM's certificate (e.g., your enterprise CA or public CA). Do *not* use `CallManager.pem` — it is a leaf certificate, not the trust anchor.
+   - Save the root CA certificate into this service's `certs/` directory.
+2. **Upload this service's certificate to UCM** — On the UCM **publisher**, go to **Cisco Unified OS Administration > Security > Certificate Management > Upload Certificate**, set **Certificate Purpose** to **CallManager-trust**, and upload `certs/server.crt`. The publisher automatically distributes trust certificates to all subscribers. No service restart is required.
+>
+> **How to tell if UCM is self-signed or CA-signed:** Run `openssl x509 -in CallManager.pem -noout -subject -issuer`. If Subject and Issuer are identical, it is self-signed. If they differ, the Issuer identifies the CA — obtain that CA's root certificate. See [Step 2 of the mTLS Setup Guide](#step-2--obtain-the-root-ca-certificate-that-signed-ucms-certificate) for details.
+
+### Step 2 — Create the External Call Control profile
+
+1. In **Cisco Unified CM Administration**, navigate to **Call Routing > External Call Control Profile**.
+2. Click **Add New**.
+3. Configure the profile fields:
+
+| Field | Value | Notes |
+|---|---|---|
+| **Name** | `Name Lookup` | Descriptive name for this profile |
+| **Primary Route Server URI** | `https://<server-fqdn-or-ip>:443/curri` | Use `http://` and port `80` if not using TLS. See note below about hostname matching |
+| **Secondary Route Server URI** | *(optional)* | Set this to a second instance for redundancy. Same hostname matching rules apply |
+| **Routing Request Timer** | `2000` | Milliseconds UCM waits for a response before treating the request as failed. Increase if the service is on a high-latency link |
+| **Call Treatment on Failures** | `Allow` | **Critical:** set this to **Allow** so calls continue normally if the service is unreachable. Setting it to Deny would block calls on failure |
+| **Connection Reuse Timer** | `60` | Seconds UCM keeps idle HTTP connections open. The service handles HEAD keepalive probes automatically |
+
+4. Click **Save**.
+
+> **Hostname matching (TLS):** The hostname or IP address in the Route Server URI must match a CN or SAN entry in this service's TLS certificate (`certs/server.crt`). UCM validates the server certificate during the TLS handshake and will reject the connection if the URI does not match. For example, if the certificate was generated with `./setup_certs.sh --hostname 10.1.1.50`, the URI must use `https://10.1.1.50:443/curri`. If it was generated with `--hostname curri.example.com`, the URI must use `https://curri.example.com:443/curri`.
+
+> **Tip — Redundancy:** If you run two instances of this service (e.g., on separate hosts), enter the second instance URL as the **Secondary Route Server URI**. UCM will fail over to the secondary if the primary is unreachable.
+>
+> A load balancer can also be placed in front of multiple instances, but it **must operate at Layer 4 (TCP passthrough)**. The load balancer must **not** perform SSL termination or inspection — any form of TLS interception will break mTLS because UCM's client certificate will not reach the service, and the service's certificate will not be presented to UCM. Configure the load balancer to forward raw TCP connections without decrypting them.
+
+### Step 3 — Adjust service parameters
+
+Several service parameters control how UCM interacts with External Call Control services. Review and adjust these as needed.
+
+1. Navigate to **System > Service Parameters**.
+2. Select a UCM server and choose **Cisco CallManager** as the service.
+3. Find the **Clusterwide Parameters (External Call Control)** section:
+
+| Parameter | Default | Recommended | Notes |
+|---|---|---|---|
+| **Maximum Number of PDP Connections per Node** | `20` | Match Gunicorn workers × threads | This service defaults to 4 workers × 4 threads = 16 concurrent connections. Set this parameter to at least `16` (or whatever you configured in Gunicorn) |
+| **PDP Connection Keep Alive Timer** | `30` | `30` | Seconds between HEAD keepalive probes. The service responds to HEAD requests on `/curri` automatically |
+| **PDP Retry Timer** | `3` | `3` | Seconds to wait before retrying a failed connection |
+
+4. Click **Save** and confirm the change applies to all nodes.
+
+### Step 4 — Apply the ECC profile to call routing
+
+The ECC profile must be assigned to the call routing elements (patterns) where you want caller name lookups to occur. UCM sends a CURRI request to this service each time a call matches a pattern that has an ECC profile assigned.
+
+Choose one or more of the following depending on your deployment:
+
+#### Option A — Directory Numbers (per-line)
+
+Best for looking up names on specific lines (e.g., receptionist phones, call center agents):
+
+1. Navigate to **Device > Phone**, find the phone, and click the **Directory Number** (line) you want to enable.
+2. Scroll to the **External Call Control Profile** drop-down under the **Incoming Calls** section.
+3. Select the profile you created in Step 2.
+4. Click **Save** and **Apply Config**.
+
+#### Option B — Translation Patterns (recommended for broad coverage)
+
+Best for applying name lookups to a range of numbers without modifying individual DNs:
+
+1. Navigate to **Call Routing > Translation Pattern**.
+2. Create a new Translation Pattern (or edit an existing one) that matches the inbound calling number range. For example:
+   - **Translation Pattern:** `!` (matches any number) or a specific range like `2XXX`
+   - **Partition / Calling Search Space:** configure to match your dial plan
+3. Set the **External Call Control Profile** drop-down to the profile you created.
+4. Set **Called Party Transformation Mask** and other fields as needed for your dial plan.
+5. Click **Save**.
+
+> **Note:** Translation Patterns are evaluated based on calling search spaces and partitions. Ensure the pattern is reachable in the call flow for the calls you want to apply name lookups to.
+
+#### Option C — Route Patterns
+
+Best for applying name lookups to calls leaving the cluster (e.g., outbound calls through a gateway or SIP trunk):
+
+1. Navigate to **Call Routing > Route/Hunt > Route Pattern**.
+2. Edit the Route Pattern for the desired destination range.
+3. Set the **External Call Control Profile** drop-down to the profile you created.
+4. Click **Save**.
+
+#### Option D — SIP Route Patterns
+
+For SIP trunk routing:
+
+1. Navigate to **Call Routing > SIP Route Pattern**.
+2. Edit or create the SIP Route Pattern.
+3. Set the **External Call Control Profile**.
+4. Click **Save**.
+
+### Step 5 — Number format considerations
+
+The phone numbers in your `phone_directory.csv` must match the format that UCM sends in the CURRI request. UCM sends the calling party number as it appears at the point in the call flow where the ECC profile is applied.
+
+- **Before digit manipulation:** If the ECC profile is on a Translation Pattern that runs before calling party transformations, the number will be in its original received format.
+- **After digit manipulation:** If transformations (e.g., globalization, E.164 normalization) have already been applied, the number will be in the transformed format.
+
+The service checks the `callingnumber` attribute first, then falls back to `transformedcgpn` (the transformed calling party globalized number). To determine what format UCM is sending:
+
+1. Set `log_level: DEBUG` in `config.yaml`.
+2. Place a test call.
+3. Check the logs for the parsed XACML attributes:
    ```
-   http(s)://<server-ip>:<port>/curri
+   Parsed XACML attribute: urn:Cisco:uc:1.0:callingnumber = +12125551001
+   Parsed XACML attribute: urn:Cisco:uc:1.0:transformedcgpn = +12125551001
    ```
-3. Set the **Routing Request Timer** appropriately (e.g., 2000 ms).
-4. Set **Call Treatment on Failures** to continue routing normally.
-5. Apply the ECC profile to the desired Directory Numbers, Translation Patterns, or Route Patterns that should trigger name lookups.
+4. Use the number format you see in the logs as the format for your CSV entries.
+
+> **Tip:** If UCM sends numbers in E.164 format (e.g., `+12125551212`), include the `+` and country code in your CSV. The service normalizes numbers by stripping formatting characters (`-`, `()`, `.`, spaces) but preserves the leading `+`.
+
+### Step 6 — Verify the integration
+
+After completing the configuration on both sides:
+
+1. **Check the ECC profile status** in UCM:
+   - Navigate to **Call Routing > External Call Control Profile** and open your profile.
+   - The **PDP Status** should show **Active** for each server. If it shows **Inactive**, UCM cannot reach the service — check network connectivity, TLS certificates, and firewall rules.
+
+2. **Place a test call** from a phone whose call flow passes through a pattern with the ECC profile:
+   - Call a number where the calling party is listed in `phone_directory.csv`.
+   - The receiving phone should display the name from the CSV instead of (or in addition to) the default caller ID.
+
+3. **Check the service logs** for the CURRI request:
+   ```bash
+   # Docker
+   docker compose logs -f
+
+   # Or file logs (if log_dir is configured)
+   tail -f logs/app.log
+   ```
+   You should see a log entry showing the parsed calling number and the matched display name.
+
+4. **If the name is not updated:**
+   - Verify the ECC profile shows **Active** status on the UCM server.
+   - Verify the phone number format in the CSV matches what UCM sends (use DEBUG logging).
+   - Verify the ECC profile is applied to the correct pattern in the call flow.
+   - Check for TLS errors in the service logs and in UCM's RTMT (Real-Time Monitoring Tool) under **Trace & Log Central**.
+
+### UCM troubleshooting tools
+
+- **RTMT (Real-Time Monitoring Tool):** Collect SDL traces with the **External Call Control** filter enabled to see the XACML request/response exchange.
+- **Dialed Number Analyzer:** Use **Call Routing > Dialed Number Analyzer** to trace a call through the dial plan and confirm it hits a pattern with the ECC profile.
+- **CURRI keepalive:** UCM sends periodic HEAD requests to `/curri` to check if the service is available. If these fail, UCM marks the PDP as inactive. Check network/firewall rules if the status is stuck on Inactive.
 
 ## API Endpoints
 
@@ -551,7 +725,7 @@ Use this checklist when moving from a development setup to a production deployme
 
 - [ ] Generate a server certificate with `./setup_certs.sh --hostname <fqdn>` (see [Step 1](#step-1--generate-the-server-certificate))
 - [ ] Export each UCM cluster's `CallManager.pem` CA certificate (see [Step 2](#step-2--export-ucms-ca-certificate))
-- [ ] Upload `certs/server.crt` to every UCM node's **CallManager-trust** store (see [Step 3](#step-3--upload-the-server-certificate-to-ucm))
+- [ ] Upload `certs/server.crt` to the UCM publisher's **CallManager-trust** store (see [Step 3](#step-3--upload-the-server-certificate-to-ucm))
 - [ ] Set `ca_bundle_path` in `config.yaml` (e.g., `/tmp/ca-bundle.pem` for Docker)
 
 ### Cluster access control
@@ -577,19 +751,25 @@ Use this checklist when moving from a development setup to a production deployme
 
 ### UCM configuration
 
+See [UCM Configuration](#ucm-configuration) for detailed instructions on each step.
+
+- [ ] Obtain the root CA certificate for each UCM cluster — `CallManager.pem` if self-signed, or the CA root cert if CA-signed (mTLS only)
+- [ ] Upload `certs/server.crt` to **CallManager-trust** on the UCM publisher (mTLS only)
 - [ ] Create an External Call Control profile pointing to `https://<server>:443/curri`
 - [ ] Set **Routing Request Timer** (e.g., 2000 ms)
-- [ ] Set **Call Treatment on Failures** to continue routing
-- [ ] Apply the ECC profile to the desired Directory Numbers or patterns
-- [ ] Tune **Maximum Connection Count to PDP** to match Gunicorn workers × threads (default: 16)
+- [ ] Set **Call Treatment on Failures** to **Allow**
+- [ ] Set **Maximum Number of PDP Connections per Node** to match Gunicorn workers × threads (default: 16)
+- [ ] Apply the ECC profile to the desired Directory Numbers, Translation Patterns, or Route Patterns
+- [ ] Verify the phone number format in your CSV matches what UCM sends (use `log_level: DEBUG` to check)
 
 ### Verification
 
 - [ ] Confirm health check passes: `curl -k https://localhost:443/health` (or check `docker compose ps`)
+- [ ] Confirm ECC profile shows **Active** PDP status in UCM
 - [ ] Place a test call through UCM and verify the caller display name is updated
 - [ ] Check log files are being written: `ls -la logs/`
-- [ ] Set `log_level: DEBUG` temporarily if troubleshooting TLS issues
+- [ ] Set `log_level: DEBUG` temporarily if troubleshooting TLS or number format issues
 
 ## License
 
-Internal use.
+This project is licensed under the [MIT License](LICENSE).
