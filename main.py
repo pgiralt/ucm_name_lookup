@@ -48,6 +48,7 @@ Environment Variables:
 import csv
 import ipaddress
 import logging
+import logging.handlers
 import os
 import ssl
 import sys
@@ -117,6 +118,12 @@ LOG_LEVEL = os.environ.get(
     "LOG_LEVEL", _config.get("log_level", "INFO")
 ).upper()
 
+# Optional directory for rotating log files. When set, the application
+# writes log files here in addition to stdout/stderr.
+LOG_DIR = _config.get("log_dir")
+LOG_MAX_BYTES = int(_config.get("log_max_bytes", 10 * 1024 * 1024))  # 10 MB
+LOG_BACKUP_COUNT = int(_config.get("log_backup_count", 5))
+
 # XACML 2.0 namespace used by UCM in CURRI requests.
 XACML_NS = "urn:oasis:names:tc:xacml:2.0:context:schema:os"
 
@@ -130,11 +137,30 @@ CURRI_ATTR_TRANSFORMED_CDPN = "urn:Cisco:uc:1.0:transformedcdpn"
 # Logging Setup
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+_log_fmt = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+_log_level = getattr(logging, LOG_LEVEL, logging.INFO)
+
+# Console handler (always active — supports `docker logs`).
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_log_fmt)
+
+logging.root.setLevel(_log_level)
+logging.root.addHandler(_console_handler)
+
+# Rotating file handler (active when log_dir is configured).
+if LOG_DIR:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    _file_handler = logging.handlers.RotatingFileHandler(
+        os.path.join(LOG_DIR, "app.log"),
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+    )
+    _file_handler.setFormatter(_log_fmt)
+    logging.root.addHandler(_file_handler)
+
 logger = logging.getLogger("ucm_name_lookup")
 
 # ---------------------------------------------------------------------------

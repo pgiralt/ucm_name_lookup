@@ -73,6 +73,9 @@ COPY config.yaml.example config.yaml
 # and config.yaml over these files via Docker volumes or bind mounts.
 COPY phone_directory.csv .
 
+# Create log directory (writable by appuser for rotating log files).
+RUN mkdir -p /app/logs && chown appuser:appuser /app/logs
+
 # Switch to non-root user.
 USER appuser
 

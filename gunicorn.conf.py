@@ -30,6 +30,7 @@ worker_tmp_dir = "/dev/shm"
 timeout = 30
 accesslog = "-"
 errorlog = "-"
+access_log_format = '%(h)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s"'
 
 # ---------------------------------------------------------------------------
 # Load application config (same file the app uses at runtime)
@@ -40,6 +41,76 @@ _config = {}
 if os.path.isfile(_config_path):
     with open(_config_path, encoding="utf-8") as _f:
         _config = yaml.safe_load(_f) or {}
+
+# --- Log directory with rotation ---
+# When log_dir is set, write Gunicorn access and error logs to rotating
+# files there in addition to the console. Uses Python's RotatingFileHandler
+# so log files are automatically rotated before they fill the disk.
+_log_dir = _config.get("log_dir")
+_log_max_bytes = int(_config.get("log_max_bytes", 10 * 1024 * 1024))  # 10 MB
+_log_backup_count = int(_config.get("log_backup_count", 5))
+
+if _log_dir:
+    os.makedirs(_log_dir, exist_ok=True)
+    _access_log_file = os.path.join(_log_dir, "access.log")
+    _error_log_file = os.path.join(_log_dir, "error.log")
+
+    logconfig_dict = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "generic": {
+                "format": "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                "datefmt": "%Y-%m-%d %H:%M:%S",
+            },
+            "access": {
+                "format": "%(asctime)s [ACCESS] %(message)s",
+                "datefmt": "%Y-%m-%d %H:%M:%S",
+            },
+        },
+        "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "formatter": "generic",
+                "stream": "ext://sys.stderr",
+            },
+            "error_file": {
+                "class": "logging.handlers.RotatingFileHandler",
+                "formatter": "generic",
+                "filename": _error_log_file,
+                "maxBytes": _log_max_bytes,
+                "backupCount": _log_backup_count,
+            },
+            "access_console": {
+                "class": "logging.StreamHandler",
+                "formatter": "access",
+                "stream": "ext://sys.stdout",
+            },
+            "access_file": {
+                "class": "logging.handlers.RotatingFileHandler",
+                "formatter": "access",
+                "filename": _access_log_file,
+                "maxBytes": _log_max_bytes,
+                "backupCount": _log_backup_count,
+            },
+        },
+        "loggers": {
+            "gunicorn.error": {
+                "level": "INFO",
+                "handlers": ["console", "error_file"],
+                "propagate": False,
+            },
+            "gunicorn.access": {
+                "level": "INFO",
+                "handlers": ["access_console", "access_file"],
+                "propagate": False,
+            },
+        },
+        "root": {
+            "level": "INFO",
+            "handlers": ["console"],
+        },
+    }
 
 _cert = _config.get("tls_cert_file", "certs/server.crt")
 _key = _config.get("tls_key_file", "certs/server.key")

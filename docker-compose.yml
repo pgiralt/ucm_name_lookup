@@ -18,4 +18,5 @@ services:
       - ./config.yaml:/app/config.yaml:ro
       - ./phone_directory.csv:/app/phone_directory.csv:ro
       - ./certs:/app/certs:ro
+      - ./logs:/app/logs
     restart: unless-stopped
