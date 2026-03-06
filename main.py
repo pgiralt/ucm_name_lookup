@@ -167,6 +167,36 @@ class ClusterConfig:
     ca_subject: tuple | None = None
 
 
+def _dn_matches(dn_a: tuple | None, dn_b: tuple | None) -> bool:
+    """Compare two X.509 Distinguished Name tuples, ignoring RDN order.
+
+    Python's ``ssl`` module represents DNs as nested tuples::
+
+        ((('commonName', 'Example CA'),),
+         (('organizationName', 'Example Inc.'),),
+         ...)
+
+    ``get_ca_certs()`` and ``getpeercert()`` can return the same
+    logical DN with RDNs in a different order. This function
+    normalizes both sides to frozensets of ``(type, value)`` pairs
+    so the comparison succeeds regardless of ordering.
+    """
+    if dn_a is None or dn_b is None:
+        return dn_a is dn_b
+    try:
+        attrs_a: set[tuple[str, str]] = set()
+        for rdn in dn_a:
+            for attr_type, attr_value in rdn:
+                attrs_a.add((attr_type, attr_value))
+        attrs_b: set[tuple[str, str]] = set()
+        for rdn in dn_b:
+            for attr_type, attr_value in rdn:
+                attrs_b.add((attr_type, attr_value))
+        return attrs_a == attrs_b
+    except (TypeError, ValueError):
+        return dn_a == dn_b
+
+
 def _load_ca_subject(
     ca_file: str, cluster_name: str
 ) -> tuple | None:
@@ -345,6 +375,11 @@ if CLUSTERS:
         if _cl.ca_subject:
             _parts.append(
                 "app-layer CA issuer verification: enabled"
+            )
+            logger.debug(
+                "Cluster '%s': stored CA subject tuple: %s",
+                _cl.name,
+                _cl.ca_subject,
             )
         logger.info(
             "Cluster '%s' — %s",
@@ -755,11 +790,15 @@ def _enforce_cluster_access():
                 )
                 continue
             cert_issuer = cert.get("issuer")
-            if cert_issuer != cluster.ca_subject:
+            if not _dn_matches(cert_issuer, cluster.ca_subject):
                 logger.debug(
                     "Cluster '%s': cert issuer does not match "
-                    "cluster CA subject",
+                    "cluster CA subject.\n"
+                    "  Client cert issuer : %s\n"
+                    "  Stored CA subject  : %s",
                     cluster.name,
+                    cert_issuer,
+                    cluster.ca_subject,
                 )
                 continue
 
