@@ -241,13 +241,19 @@ services:
 
 No `GUNICORN_CMD_ARGS` needed — `gunicorn.conf.py` reads `config.yaml` and auto-configures everything.
 
-### Application-Layer Certificate Verification
+### TLS Chain Validation
 
-Because the TLS layer accepts any client certificate signed by *any* CA in the combined bundle, the application adds a **per-cluster certificate check** at request time. It compares the client certificate's **issuer** against the CA's subject — verifying the client cert was signed by this specific CA.
+Gunicorn uses `CERT_REQUIRED` when a CA bundle is present, so OpenSSL validates the full certificate chain at the TLS handshake. If the client certificate does not chain to a trusted root in the CA bundle, the connection is rejected before the request reaches the application. No application-layer chain verification is needed.
 
-This happens automatically whenever `ca_file` is set for a cluster. No additional configuration is needed.
+> **Important:** The `ca_file` must be the **root CA certificate** (`CA:TRUE`) that anchors the client certificate chain. If a leaf/identity certificate is detected at startup, the application exits with an error. For self-signed UCM clusters, this is typically the `CallManager.pem` certificate exported from UCM OS Administration under **Security > Certificate Management**. For UCM clusters using certificates signed by a public or enterprise CA, provide the root CA certificate (e.g. the IdenTrust root for HydrantID-signed certificates).
 
-> **Important:** The `ca_file` must be a **CA certificate** (`CA:TRUE`), not the UCM's identity/leaf certificate. If a leaf certificate is detected at startup, the application exits with an error. The CA certificate is typically the one that signed the UCM's `CallManager.pem` — you can export it from UCM OS Administration under **Security > Certificate Management**. For UCM clusters using certificates signed by a public or enterprise CA, provide the issuing CA's certificate (or the intermediate CA certificate).
+#### Multi-cluster trust boundary limitation
+
+When multiple clusters define **different** `ca_file` entries, all root CA certificates are combined into a single CA bundle for Gunicorn. This means the TLS layer accepts any client certificate that chains to *any* root in the bundle — it cannot distinguish which root a given connection was validated against. A client certificate signed by cluster B's root CA will pass the TLS handshake even when matching against cluster A's rules.
+
+In practice, `allowed_subjects` and `allowed_ips` provide effective cluster isolation because different clusters have distinct server hostnames and IP addresses. However, if two clusters have **overlapping `allowed_subjects` and different root CAs**, there is no application-layer defense to enforce per-cluster CA trust boundaries. Python's `ssl` module does not expose the verified certificate chain.
+
+If strict per-cluster CA isolation is required with overlapping subjects, run **separate service instances** (one per trust boundary) with independent CA bundles.
 
 ### Certificate Subject Validation (CN/SAN)
 

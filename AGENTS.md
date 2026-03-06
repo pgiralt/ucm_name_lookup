@@ -67,14 +67,15 @@ The `clusters` section in `config.yaml` supports multiple UCM clusters. Each clu
 
 A request must match **at least one** cluster. Matching means passing **all** of that cluster's defined rules.
 
-**Three-layer enforcement** per cluster (in `_enforce_cluster_access`):
+**Two-layer app enforcement** per cluster (in `_enforce_cluster_access`):
 1. IP address check against `allowed_networks`
 2. Certificate CN/SAN check against `allowed_subjects`
-3. Certificate verification against `ca_subject` (app-layer)
 
-The `ca_file` **must** be a CA certificate (`CA:TRUE`), not a leaf/identity certificate. If a leaf certificate is detected at startup, the application exits with a clear error message directing the user to provide the CA certificate instead. The CA certificate is typically the one that signed the UCM's identity certificate — it can be exported from UCM OS Administration under Security > Certificate Management.
+**TLS-layer chain validation** is handled separately by Gunicorn with `CERT_REQUIRED`. When `ca_file` is set, the client certificate must chain to a trusted root CA in the combined CA bundle — connections that fail chain validation are rejected at the TLS handshake before reaching the application.
 
-The third check compares the client cert's **issuer** against the CA's subject — verifying the client cert was signed by this specific CA. This is critical in production because Gunicorn uses a single combined CA bundle (`--ca-certs`), so the TLS layer accepts certs from *any* cluster's CA. The app-layer issuer check ensures a client cert signed by cluster B's CA cannot authorize a request as cluster A.
+The `ca_file` **must** be the root CA certificate (`CA:TRUE`) that anchors the client certificate chain. It can include intermediate CAs in the chain. If a leaf certificate is detected at startup, the application exits with a clear error. The root CA certificate can typically be exported from UCM OS Administration under Security > Certificate Management.
+
+**Multi-cluster trust boundary limitation:** When multiple clusters define different `ca_file` entries, all roots are combined into one CA bundle. The TLS layer cannot distinguish which root validated a given connection. Cluster isolation relies on `allowed_subjects` and `allowed_ips` having no overlap. If strict per-cluster CA isolation with overlapping subjects is needed, run separate service instances.
 
 ### CA bundle auto-generation
 

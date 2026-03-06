@@ -164,47 +164,12 @@ class ClusterConfig:
     ] = field(default_factory=list)
     allowed_subjects: set[str] = field(default_factory=set)
     ca_file: str | None = None
-    ca_subject: tuple | None = None
 
 
-def _dn_matches(dn_a: tuple | None, dn_b: tuple | None) -> bool:
-    """Compare two X.509 Distinguished Name tuples, ignoring RDN order.
-
-    Python's ``ssl`` module represents DNs as nested tuples::
-
-        ((('commonName', 'Example CA'),),
-         (('organizationName', 'Example Inc.'),),
-         ...)
-
-    ``get_ca_certs()`` and ``getpeercert()`` can return the same
-    logical DN with RDNs in a different order. This function
-    normalizes both sides to frozensets of ``(type, value)`` pairs
-    so the comparison succeeds regardless of ordering.
-    """
-    if dn_a is None or dn_b is None:
-        return dn_a is dn_b
-    try:
-        attrs_a: set[tuple[str, str]] = set()
-        for rdn in dn_a:
-            for attr_type, attr_value in rdn:
-                attrs_a.add((attr_type, attr_value))
-        attrs_b: set[tuple[str, str]] = set()
-        for rdn in dn_b:
-            for attr_type, attr_value in rdn:
-                attrs_b.add((attr_type, attr_value))
-        return attrs_a == attrs_b
-    except (TypeError, ValueError):
-        return dn_a == dn_b
-
-
-def _load_ca_subject(
+def _validate_ca_cert(
     ca_file: str, cluster_name: str
-) -> tuple | None:
-    """Load a CA certificate and return its ``subject`` tuple.
-
-    The returned tuple uses the same nested-tuple format as
-    :meth:`ssl.SSLSocket.getpeercert` so that it can be directly
-    compared with a client certificate's ``issuer`` at request time.
+) -> bool:
+    """Validate that a CA file contains a proper CA certificate.
 
     The file **must** contain a CA certificate (``CA:TRUE``). If a
     leaf certificate is detected instead, an error is logged and the
@@ -212,7 +177,9 @@ def _load_ca_subject(
     signed the UCM's identity certificate, not the identity
     certificate itself.
 
-    Returns the ``subject`` tuple or ``None``.
+    Returns ``True`` if the CA cert is valid, ``False`` otherwise.
+    The TLS layer (Gunicorn with ``CERT_REQUIRED``) handles full
+    chain validation at connection time.
     """
     # --- Try loading as a CA certificate ---
     try:
@@ -220,7 +187,7 @@ def _load_ca_subject(
         ctx.load_verify_locations(ca_file)
         ca_certs = ctx.get_ca_certs()
         if ca_certs:
-            return ca_certs[0].get("subject")
+            return True
     except (ssl.SSLError, OSError) as exc:
         logger.error(
             "Cluster '%s': failed to load CA file '%s': %s",
@@ -228,7 +195,7 @@ def _load_ca_subject(
             ca_file,
             exc,
         )
-        return None
+        return False
 
     # --- Detect leaf certificate and give a clear error ---
     try:
@@ -258,7 +225,7 @@ def _load_ca_subject(
         cluster_name,
         ca_file,
     )
-    return None
+    return False
 
 
 def _parse_network_list(
@@ -330,11 +297,10 @@ def _parse_clusters(raw_clusters: dict) -> list[ClusterConfig]:
             cfg.get("allowed_subjects", [])
         )
         ca_file = cfg.get("ca_file")
-        ca_subject = None
         if ca_file is not None:
             ca_file = str(ca_file)
             if os.path.isfile(ca_file):
-                ca_subject = _load_ca_subject(ca_file, str(name))
+                _validate_ca_cert(ca_file, str(name))
             else:
                 logger.error(
                     "Cluster '%s': CA file not found: %s", name, ca_file
@@ -347,7 +313,6 @@ def _parse_clusters(raw_clusters: dict) -> list[ClusterConfig]:
                 allowed_networks=networks,
                 allowed_subjects=subjects,
                 ca_file=ca_file,
-                ca_subject=ca_subject,
             )
         )
     return clusters
@@ -371,16 +336,7 @@ if CLUSTERS:
                 + ", ".join(sorted(_cl.allowed_subjects))
             )
         if _cl.ca_file:
-            _parts.append(f"CA: {_cl.ca_file}")
-        if _cl.ca_subject:
-            _parts.append(
-                "app-layer CA issuer verification: enabled"
-            )
-            logger.debug(
-                "Cluster '%s': stored CA subject tuple: %s",
-                _cl.name,
-                _cl.ca_subject,
-            )
+            _parts.append(f"CA: {_cl.ca_file} (chain validated by TLS layer)")
         logger.info(
             "Cluster '%s' — %s",
             _cl.name,
@@ -731,9 +687,7 @@ def _enforce_cluster_access():
         return Response("Forbidden\n", status=403, mimetype="text/plain")
 
     # --- Lazily obtain client certificate (only if needed) ---
-    need_cert = any(
-        c.allowed_subjects or c.ca_subject for c in CLUSTERS
-    )
+    need_cert = any(c.allowed_subjects for c in CLUSTERS)
     cert: dict | None = None
     cert_subjects: set[str] | None = None
     if need_cert:
@@ -778,29 +732,10 @@ def _enforce_cluster_access():
                 )
                 continue
 
-        # 3. CA issuer verification (application-layer)
-        #    Ensures a client cert signed by cluster B's CA cannot
-        #    authorize a request as cluster A.
-        if cluster.ca_subject:
-            if cert is None:
-                logger.debug(
-                    "Cluster '%s': certificate verification required "
-                    "but client certificate is not accessible",
-                    cluster.name,
-                )
-                continue
-            cert_issuer = cert.get("issuer")
-            if not _dn_matches(cert_issuer, cluster.ca_subject):
-                logger.debug(
-                    "Cluster '%s': cert issuer does not match "
-                    "cluster CA subject.\n"
-                    "  Client cert issuer : %s\n"
-                    "  Stored CA subject  : %s",
-                    cluster.name,
-                    cert_issuer,
-                    cluster.ca_subject,
-                )
-                continue
+        # Note: CA chain validation is handled by the TLS layer
+        # (Gunicorn with CERT_REQUIRED). If the client cert does not
+        # chain to a trusted root in the CA bundle, the TLS handshake
+        # fails before the request reaches the application.
 
         # All defined rules passed — request is authorized.
         logger.debug(
