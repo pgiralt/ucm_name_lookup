@@ -223,7 +223,7 @@ def _start_insecure_mode_warning() -> None:
     _schedule_next()
 
 
-if os.path.isfile(_cert) and os.path.isfile(_key):
+if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
     certfile = _cert
     keyfile = _key
     bind = "0.0.0.0:443"

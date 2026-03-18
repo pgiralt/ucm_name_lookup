@@ -281,7 +281,7 @@ class ClusterConfig:
     """Access rules for a single UCM cluster.
 
     A request is authorized by a cluster when **all** of the cluster's
-    rules match:
+    active rules match:
 
         * The client IP must fall within at least one network in
           ``allowed_networks``.  An empty list matches **no** IPs.
@@ -289,8 +289,14 @@ class ClusterConfig:
           in ``allowed_subjects``.  An empty set matches **no**
           subjects.
 
-    Every rule uses deny-by-default semantics: omitting a rule is
-    equivalent to blocking all traffic for that criterion.
+    In **insecure mode only**, when a cluster defines neither
+    ``allowed_subjects`` nor ``ca_file``, the certificate subject
+    check is skipped and only IP-based access control is enforced.
+    In secure mode, every cluster must have certificate
+    infrastructure or the service refuses to start.
+
+    Every active rule uses deny-by-default semantics: configuring a
+    rule but leaving it empty blocks all traffic for that criterion.
     """
 
     name: str
@@ -487,6 +493,22 @@ if CLUSTERS:
             )
         if _cl.ca_file:
             _parts.append(f"CA: {_cl.ca_file} (chain validated by TLS layer)")
+        # In secure mode, every cluster must have cert infrastructure.
+        # IP-only clusters (no allowed_subjects and no ca_file) are
+        # only permitted in insecure mode.
+        _has_cert_rules = bool(_cl.allowed_subjects) or bool(_cl.ca_file)
+        if _cl.allowed_networks and not _has_cert_rules:
+            if not INSECURE_MODE:
+                logger.error(
+                    "Cluster '%s' has allowed_ips but no "
+                    "allowed_subjects or ca_file. In secure mode, "
+                    "every cluster must define certificate "
+                    "infrastructure (allowed_subjects and/or "
+                    "ca_file). Either add them or set "
+                    "'insecure_mode: true' for IP-only access.",
+                    _cl.name,
+                )
+                sys.exit(1)
         if _parts:
             logger.info("Cluster '%s' — %s", _cl.name, "; ".join(_parts))
         else:
@@ -775,16 +797,22 @@ def _enforce_cluster_access():
 
     When clusters are defined in the configuration file, every request
     to the ``/curri`` endpoint must match **at least one** cluster.
-    Matching means satisfying **all** of the cluster's rules:
+    Matching means satisfying **all** of the cluster's active rules:
 
         1. The client IP must be within one of the cluster's
            ``allowed_ips`` networks.  An empty list denies all IPs.
-        2. The client certificate must contain at least one CN or SAN
-           in the cluster's ``allowed_subjects``.  An empty set denies
-           all subjects.
+        2. If the cluster has certificate infrastructure configured
+           (``allowed_subjects`` or ``ca_file``), the client
+           certificate must contain at least one CN or SAN in the
+           cluster's ``allowed_subjects``.  An empty set denies all
+           subjects.
 
-    Every rule uses **deny-by-default** semantics: omitting a rule
-    blocks all traffic for that criterion rather than allowing it.
+    When a cluster defines neither ``allowed_subjects`` nor
+    ``ca_file``, the certificate subject check is skipped entirely,
+    allowing IP-only access control (typical for insecure mode).
+
+    Every active rule uses **deny-by-default** semantics: configuring
+    a rule but leaving it empty blocks all traffic for that criterion.
 
     The ``/health`` endpoint is restricted to localhost (``127.0.0.1``
     and ``::1``) so that only the Docker health check and local probes
@@ -837,9 +865,16 @@ def _enforce_cluster_access():
     )
 
     # --- Check each cluster until one matches ---
-    # Every rule uses deny-by-default: an empty allowed_networks list
-    # matches no IPs, and an empty allowed_subjects set matches no
-    # subjects. A cluster must explicitly list what it permits.
+    # Every active rule uses deny-by-default: an empty
+    # allowed_networks list matches no IPs, and an empty
+    # allowed_subjects set matches no subjects. A cluster must
+    # explicitly list what it permits.
+    #
+    # In insecure mode only, when a cluster has no certificate
+    # infrastructure (no allowed_subjects AND no ca_file), the
+    # subject check is skipped for IP-only access control. In
+    # secure mode the startup check ensures every cluster has cert
+    # infrastructure, so this branch is never reached.
     for cluster in CLUSTERS:
         # 1. IP check (empty list → deny all)
         if not any(client_ip in net for net in cluster.allowed_networks):
@@ -850,22 +885,26 @@ def _enforce_cluster_access():
             )
             continue
 
-        # 2. Certificate subject check (empty set → deny all)
-        if cert_subjects is None:
-            logger.debug(
-                "Cluster '%s': client certificate is not accessible",
-                cluster.name,
-            )
-            continue
-        if not (cert_subjects & cluster.allowed_subjects):
-            logger.debug(
-                "Cluster '%s': cert subjects %s do not match "
-                "allowed_subjects %s",
-                cluster.name,
-                sorted(cert_subjects),
-                sorted(cluster.allowed_subjects),
-            )
-            continue
+        # 2. Certificate subject check.
+        #    Skipped only in insecure mode when the cluster has no
+        #    cert infrastructure (no allowed_subjects and no ca_file).
+        _has_cert_rules = bool(cluster.allowed_subjects) or bool(cluster.ca_file)
+        if _has_cert_rules or not INSECURE_MODE:
+            if cert_subjects is None:
+                logger.debug(
+                    "Cluster '%s': client certificate is not accessible",
+                    cluster.name,
+                )
+                continue
+            if not (cert_subjects & cluster.allowed_subjects):
+                logger.debug(
+                    "Cluster '%s': cert subjects %s do not match "
+                    "allowed_subjects %s",
+                    cluster.name,
+                    sorted(cert_subjects),
+                    sorted(cluster.allowed_subjects),
+                )
+                continue
 
         # Note: CA chain validation is handled by the TLS layer
         # (Gunicorn with CERT_REQUIRED). If the client cert does not
