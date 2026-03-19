@@ -261,6 +261,19 @@ class TestTlsHandshakeLogging:
                     "TLS handshake failed from %s: %s", peer_str, exc
                 )
                 raise
+            except OSError as exc:
+                try:
+                    peer = sock.getpeername()
+                    peer_str = f"{peer[0]}:{peer[1]}"
+                except (OSError, IndexError):
+                    peer_str = "<unknown>"
+                tls_logger.warning(
+                    "TLS handshake failed from %s "
+                    "(client disconnected — may have rejected the "
+                    "server certificate): %s",
+                    peer_str, exc,
+                )
+                raise
 
         ctx.wrap_socket = _logging_wrap_socket  # type: ignore[assignment]
 
@@ -403,3 +416,71 @@ class TestTlsHandshakeLogging:
             if "TLS handshake failed" in r.message
         ]
         assert handshake_warnings == []
+
+    def test_client_rejects_server_cert_logs_warning(self, tmp_path, caplog):
+        """When the client rejects the server certificate and drops the
+        connection, the server should log a WARNING indicating the client
+        disconnected (may have rejected the server certificate)."""
+        # Create two independent CAs — the client will NOT trust the
+        # server's CA, simulating UCM rejecting an untrusted server cert.
+        srv_ca_cert, srv_ca_key = generate_ca(cn="Server CA")
+        cli_ca_cert, cli_ca_key = generate_ca(cn="Client CA")
+
+        srv_cert, srv_key = generate_leaf(
+            srv_ca_cert, srv_ca_key, cn="localhost",
+            san_dns=["localhost"], san_ips=["127.0.0.1"],
+        )
+        srv_cert_path = write_pem_cert(srv_cert, tmp_path / "srv.pem")
+        srv_key_path = write_pem_key(srv_key, tmp_path / "srv-key.pem")
+        cli_ca_path = write_pem_cert(cli_ca_cert, tmp_path / "cli-ca.pem")
+
+        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        server_ctx.load_cert_chain(srv_cert_path, srv_key_path)
+        self._apply_wrap_socket_logging(server_ctx)
+
+        srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv_sock.bind(("127.0.0.1", 0))
+        srv_sock.listen(1)
+        port = srv_sock.getsockname()[1]
+
+        handshake_error = []
+
+        def _accept():
+            try:
+                conn, _ = srv_sock.accept()
+                try:
+                    server_ctx.wrap_socket(conn, server_side=True)
+                except (ssl.SSLError, OSError) as e:
+                    handshake_error.append(e)
+                    conn.close()
+            except OSError:
+                pass
+            finally:
+                srv_sock.close()
+
+        accept_thread = threading.Thread(target=_accept, daemon=True)
+        accept_thread.start()
+
+        # The client trusts only cli_ca_cert, NOT the server's CA.
+        # It will reject the server certificate and abort the handshake.
+        client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        client_ctx.load_verify_locations(cli_ca_path)
+
+        with caplog.at_level(logging.WARNING, logger="gunicorn.error"):
+            try:
+                client_sock = socket.create_connection(("127.0.0.1", port))
+                client_ctx.wrap_socket(
+                    client_sock, server_hostname="localhost"
+                )
+            except (ssl.SSLError, ConnectionResetError, BrokenPipeError, OSError):
+                pass
+
+            accept_thread.join(timeout=5)
+
+        assert len(handshake_error) == 1
+        assert any(
+            "TLS handshake failed" in rec.message
+            for rec in caplog.records
+        ), f"Expected handshake warning log, got: {[r.message for r in caplog.records]}"

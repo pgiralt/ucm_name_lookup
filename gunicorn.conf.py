@@ -268,6 +268,23 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
                     "TLS handshake failed from %s: %s", peer_str, exc
                 )
                 raise
+            except OSError as exc:
+                # Catch connection resets during the TLS handshake.
+                # This typically happens when the remote peer (e.g. UCM)
+                # rejects the server certificate and drops the connection
+                # before the handshake completes.
+                try:
+                    peer = sock.getpeername()
+                    peer_str = f"{peer[0]}:{peer[1]}"
+                except (OSError, IndexError):
+                    peer_str = "<unknown>"
+                _tls_logger.warning(
+                    "TLS handshake failed from %s "
+                    "(client disconnected — may have rejected the "
+                    "server certificate): %s",
+                    peer_str, exc,
+                )
+                raise
 
         ctx.wrap_socket = _logging_wrap_socket  # type: ignore[assignment]
         return ctx
