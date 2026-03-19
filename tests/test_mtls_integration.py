@@ -6,7 +6,11 @@ full mTLS flow, including chain validation and subject matching.
 """
 
 import ipaddress
+import logging
+import pathlib
+import socket
 import ssl
+import tempfile
 import threading
 import time
 from unittest.mock import patch
@@ -228,3 +232,174 @@ class TestMtlsHandshake:
         with patch.object(main, "_get_peer_certificate", return_value=mock_cert):
             resp = urllib.request.urlopen(req, context=ctx)
         assert resp.status == 200
+
+
+# ===========================================================================
+# TLS handshake failure logging (gunicorn.conf.py wrap_socket pattern)
+# ===========================================================================
+
+class TestTlsHandshakeLogging:
+    """Verify the wrap_socket pattern used in gunicorn.conf.py logs
+    TLS handshake failures at WARNING level with peer information."""
+
+    @staticmethod
+    def _apply_wrap_socket_logging(ctx: ssl.SSLContext) -> None:
+        """Apply the same wrap_socket wrapper that gunicorn.conf.py uses."""
+        tls_logger = logging.getLogger("gunicorn.error")
+        original_wrap_socket = ctx.wrap_socket
+
+        def _logging_wrap_socket(sock, *args, **kwargs):
+            try:
+                return original_wrap_socket(sock, *args, **kwargs)
+            except ssl.SSLError as exc:
+                try:
+                    peer = sock.getpeername()
+                    peer_str = f"{peer[0]}:{peer[1]}"
+                except (OSError, IndexError):
+                    peer_str = "<unknown>"
+                tls_logger.warning(
+                    "TLS handshake failed from %s: %s", peer_str, exc
+                )
+                raise
+
+        ctx.wrap_socket = _logging_wrap_socket  # type: ignore[assignment]
+
+    def test_no_client_cert_logs_warning(self, mtls_server, caplog):
+        """When mTLS handshake fails because no client cert is presented,
+        a WARNING should be logged with peer address and SSL error."""
+        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ca_path = mtls_server["ca_path"]
+
+        # Reuse the server cert from mtls_server fixture — we just need
+        # a listening socket that requires client certs.
+        ca_cert, ca_key = generate_ca(cn="Handshake Log CA")
+        srv_cert, srv_key = generate_leaf(
+            ca_cert, ca_key, cn="localhost",
+            san_dns=["localhost"], san_ips=["127.0.0.1"],
+        )
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        srv_cert_path = write_pem_cert(srv_cert, tmp / "srv.pem")
+        srv_key_path = write_pem_key(srv_key, tmp / "srv-key.pem")
+        ca_path = write_pem_cert(ca_cert, tmp / "ca.pem")
+
+        server_ctx.load_cert_chain(srv_cert_path, srv_key_path)
+        server_ctx.load_verify_locations(ca_path)
+        server_ctx.verify_mode = ssl.CERT_REQUIRED
+        self._apply_wrap_socket_logging(server_ctx)
+
+        # Start a minimal TLS server on an ephemeral port.
+        srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv_sock.bind(("127.0.0.1", 0))
+        srv_sock.listen(1)
+        port = srv_sock.getsockname()[1]
+
+        handshake_error = []
+
+        def _accept():
+            try:
+                conn, _ = srv_sock.accept()
+                try:
+                    server_ctx.wrap_socket(conn, server_side=True)
+                except ssl.SSLError as e:
+                    handshake_error.append(e)
+                    conn.close()
+            except OSError:
+                pass
+            finally:
+                srv_sock.close()
+
+        accept_thread = threading.Thread(target=_accept, daemon=True)
+        accept_thread.start()
+
+        # Connect without a client cert — handshake will fail.
+        # The client may raise ssl.SSLError, ConnectionResetError, or
+        # BrokenPipeError depending on timing and platform.
+        client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        client_ctx.load_verify_locations(ca_path)
+        with caplog.at_level(logging.WARNING, logger="gunicorn.error"):
+            try:
+                client_sock = socket.create_connection(("127.0.0.1", port))
+                client_ctx.wrap_socket(
+                    client_sock, server_hostname="localhost"
+                )
+            except (ssl.SSLError, ConnectionResetError, BrokenPipeError, OSError):
+                pass
+
+            # Wait inside the caplog context so the server thread's log
+            # record is captured before the log level is restored.
+            accept_thread.join(timeout=5)
+
+        assert len(handshake_error) == 1
+        # The peer address may be 127.0.0.1:<port> or <unknown> depending
+        # on whether the socket is still connected when getpeername() runs.
+        assert any(
+            "TLS handshake failed" in rec.message
+            for rec in caplog.records
+        ), f"Expected handshake warning log, got: {[r.message for r in caplog.records]}"
+
+    def test_successful_handshake_no_warning(self, tmp_path, caplog):
+        """A successful handshake should not produce any warning log."""
+        ca_cert, ca_key = generate_ca(cn="Success CA")
+        srv_cert, srv_key = generate_leaf(
+            ca_cert, ca_key, cn="localhost",
+            san_dns=["localhost"], san_ips=["127.0.0.1"],
+        )
+        cli_cert, cli_key = generate_leaf(
+            ca_cert, ca_key, cn="client.example.com",
+        )
+        srv_cert_path = write_pem_cert(srv_cert, tmp_path / "srv.pem")
+        srv_key_path = write_pem_key(srv_key, tmp_path / "srv-key.pem")
+        cli_cert_path = write_pem_cert(cli_cert, tmp_path / "cli.pem")
+        cli_key_path = write_pem_key(cli_key, tmp_path / "cli-key.pem")
+        ca_path = write_pem_cert(ca_cert, tmp_path / "ca.pem")
+
+        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        server_ctx.load_cert_chain(srv_cert_path, srv_key_path)
+        server_ctx.load_verify_locations(ca_path)
+        server_ctx.verify_mode = ssl.CERT_REQUIRED
+        self._apply_wrap_socket_logging(server_ctx)
+
+        srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv_sock.bind(("127.0.0.1", 0))
+        srv_sock.listen(1)
+        port = srv_sock.getsockname()[1]
+
+        wrapped_conn = []
+
+        def _accept():
+            try:
+                conn, _ = srv_sock.accept()
+                ssl_conn = server_ctx.wrap_socket(conn, server_side=True)
+                wrapped_conn.append(ssl_conn)
+                ssl_conn.close()
+            except OSError:
+                pass
+            finally:
+                srv_sock.close()
+
+        accept_thread = threading.Thread(target=_accept, daemon=True)
+        accept_thread.start()
+
+        client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        client_ctx.load_verify_locations(ca_path)
+        client_ctx.load_cert_chain(cli_cert_path, cli_key_path)
+
+        with caplog.at_level(logging.WARNING, logger="gunicorn.error"):
+            client_sock = socket.create_connection(("127.0.0.1", port))
+            ssl_client = client_ctx.wrap_socket(
+                client_sock, server_hostname="localhost"
+            )
+            ssl_client.close()
+
+        accept_thread.join(timeout=5)
+
+        assert len(wrapped_conn) == 1
+        handshake_warnings = [
+            r for r in caplog.records
+            if "TLS handshake failed" in r.message
+        ]
+        assert handshake_warnings == []

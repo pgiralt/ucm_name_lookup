@@ -1073,7 +1073,9 @@ def load_phone_directory(
             for row in reader:
                 # Normalize column names so minor header formatting is tolerated.
                 normalized_row = {
-                    k.strip().lower(): v.strip() for k, v in row.items()
+                    k.strip().lower(): v.strip()
+                    for k, v in row.items()
+                    if k is not None
                 }
                 phone = normalize_phone_number(
                     normalized_row.get("phone_number", "")

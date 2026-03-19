@@ -95,6 +95,19 @@ class TestLoadPhoneDirectory:
         with pytest.raises(FileNotFoundError):
             main.load_phone_directory("/nonexistent/path.csv")
 
+    def test_trailing_comma_in_csv(self, tmp_path):
+        """Rows with more fields than headers (e.g. trailing comma) must not crash."""
+        csv_file = tmp_path / "trailing.csv"
+        csv_file.write_text(
+            "phone_number,display_name\n"
+            "+15551230001,Trailing Comma,\n"
+            "+15551230002,Normal Entry\n"
+        )
+        exact, trie = main.load_phone_directory(str(csv_file))
+        assert "+15551230001" in exact
+        assert exact["+15551230001"] == "Trailing Comma"
+        assert "+15551230002" in exact
+
 
 # ===========================================================================
 # lookup_display_name

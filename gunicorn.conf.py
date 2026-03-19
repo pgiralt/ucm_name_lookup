@@ -15,6 +15,7 @@ HTTP with prominent security warnings.
 Any setting here can be overridden via ``GUNICORN_CMD_ARGS``.
 """
 
+import logging
 import os
 import secrets
 import ssl
@@ -224,17 +225,49 @@ def _start_insecure_mode_warning() -> None:
 
 
 if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
-    certfile = _cert
-    keyfile = _key
     bind = "0.0.0.0:443"
+
+    # Build the SSLContext manually so we can enforce TLSv1.2+ and
+    # intercept handshake failures with actionable log messages.
+    _ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    _ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    _ctx.load_cert_chain(_cert, _key)
 
     # Enable mTLS if the CA bundle is available.
     # CERT_REQUIRED means all TLS connections must present a valid
     # client certificate signed by a CA in the bundle. The ca_file
     # entries in config.yaml must be CA certificates, not leaf certs.
+    _mtls_enabled = False
     if _bundle_path and os.path.isfile(_bundle_path):
-        ca_certs = _bundle_path
-        cert_reqs = ssl.CERT_REQUIRED
+        _ctx.load_verify_locations(_bundle_path)
+        _ctx.verify_mode = ssl.CERT_REQUIRED
+        _mtls_enabled = True
+
+    # --- TLS handshake failure logging ---
+    # Gunicorn's gthread worker catches ssl.SSLError during
+    # wrap_socket but often logs it at DEBUG level or swallows it
+    # entirely. Wrapping the context's wrap_socket ensures every
+    # failed handshake is logged at WARNING with the peer address
+    # and the OpenSSL reason string.
+    _tls_logger = logging.getLogger("gunicorn.error")
+    _original_wrap_socket = _ctx.wrap_socket
+
+    def _logging_wrap_socket(sock, *args, **kwargs):
+        try:
+            return _original_wrap_socket(sock, *args, **kwargs)
+        except ssl.SSLError as exc:
+            try:
+                peer = sock.getpeername()
+                peer_str = f"{peer[0]}:{peer[1]}"
+            except (OSError, IndexError):
+                peer_str = "<unknown>"
+            _tls_logger.warning(
+                "TLS handshake failed from %s: %s", peer_str, exc
+            )
+            raise
+
+    _ctx.wrap_socket = _logging_wrap_socket  # type: ignore[assignment]
+    ssl_context = _ctx
 
     # --- TLS debug diagnostics (only when LOG_LEVEL=DEBUG) ---
     if _log_level == "DEBUG":
@@ -242,15 +275,11 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
         print(f"  certfile  = {_cert}")
         print(f"  keyfile   = {_key}")
         print(f"  ca_certs  = {_bundle_path or '<none>'}")
-        _cr_label = "none (no mTLS)"
-        if _bundle_path and os.path.isfile(_bundle_path):
-            _cr_label = "CERT_REQUIRED"
-        print(f"  cert_reqs = {_cr_label}")
-        if _bundle_path and os.path.isfile(_bundle_path):
+        print(f"  cert_reqs = {'CERT_REQUIRED' if _mtls_enabled else 'none (no mTLS)'}")
+        print(f"  min_ver   = TLSv1.2")
+        if _mtls_enabled:
             try:
-                _dbg_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                _dbg_ctx.load_verify_locations(_bundle_path)
-                _dbg_ca_list = _dbg_ctx.get_ca_certs()
+                _dbg_ca_list = _ctx.get_ca_certs()
                 print(
                     f"[DEBUG] CA bundle contains "
                     f"{len(_dbg_ca_list)} CA certificate(s):"
