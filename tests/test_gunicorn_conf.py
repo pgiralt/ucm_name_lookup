@@ -2,14 +2,18 @@
 
 Validates that the ``post_fork`` hook in ``gunicorn.conf.py`` correctly:
 
-1. Monkey-patches ``gunicorn.sock.ssl_wrap_socket`` to log TLS handshake
-   failures at WARNING level via ``server.log``.
-2. Wraps the gthread worker's ``enqueue_req`` to prevent event-loop crashes
-   when ``do_handshake_on_connect=True`` causes handshake errors to raise.
-3. Produces visible WARNING output when a real Gunicorn process encounters
+1. Layer 1: Monkey-patches ``gunicorn.sock.ssl_wrap_socket`` to log TLS
+   handshake failures at WARNING level via ``server.log``.
+2. Layer 2: Wraps the gthread worker's ``enqueue_req`` to prevent
+   event-loop crashes when handshake errors raise.
+3. Layer 3: Wraps ``TConn.init`` to install a ``_TlsLoggingParser`` proxy
+   around the HTTP parser, catching lazy-handshake TLS errors that
+   ``handle()`` would otherwise swallow at DEBUG level.
+4. Produces visible WARNING output when a real Gunicorn process encounters
    a TLS handshake failure from a client that rejects the server certificate.
 """
 
+import errno
 import os
 import pathlib
 import socket
@@ -101,13 +105,24 @@ class TestPostForkHook:
         return _load_gunicorn_conf(tmp_path)
 
     @pytest.fixture(autouse=True)
-    def _restore_ssl_wrap_socket(self):
-        """Save and restore ``gunicorn.sock.ssl_wrap_socket`` around each
-        test so patches from ``post_fork`` do not leak."""
+    def _restore_patched_objects(self):
+        """Save and restore objects patched by ``post_fork`` so that
+        changes do not leak between tests."""
         import gunicorn.sock as gsock
-        original = gsock.ssl_wrap_socket
+        orig_ssl_wrap = gsock.ssl_wrap_socket
+
+        try:
+            import gunicorn.workers.gthread as gthread
+            orig_tconn_init = gthread.TConn.init
+        except ImportError:
+            gthread = None
+            orig_tconn_init = None
+
         yield
-        gsock.ssl_wrap_socket = original
+
+        gsock.ssl_wrap_socket = orig_ssl_wrap
+        if gthread is not None and orig_tconn_init is not None:
+            gthread.TConn.init = orig_tconn_init
 
     # --- Config-level assertions ---
 
@@ -279,12 +294,16 @@ class TestPostForkHook:
     # --- Confirmation log ---
 
     def test_info_message_logged(self, conf):
-        """``post_fork`` should log the confirmation message."""
+        """``post_fork`` should log the confirmation message with
+        do_handshake_on_connect and parser_wrapper status."""
         server = MagicMock()
-        conf.post_fork(server, MagicMock())
-        server.log.info.assert_called_with(
-            "TLS handshake failure logging enabled"
-        )
+        worker = MagicMock()
+        worker.cfg.do_handshake_on_connect = True
+        conf.post_fork(server, worker)
+        fmt = server.log.info.call_args[0][0]
+        assert "TLS handshake failure logging enabled" in fmt
+        assert "do_handshake_on_connect" in fmt
+        assert "parser_wrapper" in fmt
 
     # --- Non-gthread workers ---
 
@@ -299,6 +318,164 @@ class TestPostForkHook:
 
         conf.post_fork(server, worker)
         assert gsock.ssl_wrap_socket is not original
+
+    # --- Layer 3: TConn.init parser wrapper ---
+
+    def test_patches_tconn_init(self, conf):
+        """``post_fork`` should replace ``TConn.init`` at the class level."""
+        import gunicorn.workers.gthread as gthread
+        original = gthread.TConn.init
+
+        conf.post_fork(MagicMock(), MagicMock())
+        assert gthread.TConn.init is not original
+
+    def test_parser_wrapper_logs_ssl_error(self, conf):
+        """Verify that TConn.init wraps the parser and that the wrapper
+        logs ssl.SSLError (non-EOF) at WARNING."""
+        import gunicorn.workers.gthread as gthread
+
+        server = MagicMock()
+        worker = MagicMock()
+        worker.cfg.do_handshake_on_connect = True
+
+        # Set TConn.init to no-op so post_fork captures it as _orig.
+        # This lets us control what self.parser is when the wrapper runs.
+        gthread.TConn.init = lambda self: None
+        conf.post_fork(server, worker)
+
+        class StubConn:
+            pass
+
+        stub = StubConn()
+        stub.cfg = MagicMock(is_ssl=True)
+        stub.client = ("10.0.0.5", 9999)
+        stub.parser = MagicMock()
+        stub.parser.__next__ = MagicMock(
+            side_effect=ssl.SSLError(ssl.SSL_ERROR_SSL, "cert verify failed")
+        )
+
+        # Call the patched init (no-op original + wrapper logic)
+        gthread.TConn.init(stub)
+
+        # Parser should now be wrapped
+        assert type(stub.parser).__name__ == "_TlsLoggingParser"
+
+        # Iterating should log WARNING and re-raise
+        server.log.reset_mock()
+        with pytest.raises(ssl.SSLError):
+            next(stub.parser)
+
+        assert server.log.warning.called
+        fmt = server.log.warning.call_args[0][0]
+        assert "TLS error" in fmt
+        peer = server.log.warning.call_args[0][1]
+        assert peer == "10.0.0.5:9999"
+
+    def test_parser_wrapper_skips_ssl_eof(self, conf):
+        """SSL_ERROR_EOF should NOT be logged at WARNING (it is a normal
+        clean close handled by handle() at DEBUG)."""
+        import gunicorn.workers.gthread as gthread
+
+        server = MagicMock()
+        worker = MagicMock()
+        worker.cfg.do_handshake_on_connect = True
+
+        # Set TConn.init to no-op so post_fork captures that
+        gthread.TConn.init = lambda self: None
+        conf.post_fork(server, worker)
+
+        class StubConn:
+            pass
+
+        stub = StubConn()
+        stub.cfg = MagicMock(is_ssl=True)
+        stub.client = ("10.0.0.5", 9999)
+        stub.parser = MagicMock()
+        stub.parser.__next__ = MagicMock(
+            side_effect=ssl.SSLError(ssl.SSL_ERROR_EOF, "EOF occurred")
+        )
+
+        gthread.TConn.init(stub)
+
+        server.log.reset_mock()
+        with pytest.raises(ssl.SSLError):
+            next(stub.parser)
+
+        server.log.warning.assert_not_called()
+
+    def test_parser_wrapper_logs_connection_reset(self, conf):
+        """ECONNRESET from the parser should be logged at WARNING."""
+        import gunicorn.workers.gthread as gthread
+
+        server = MagicMock()
+        worker = MagicMock()
+        worker.cfg.do_handshake_on_connect = True
+
+        gthread.TConn.init = lambda self: None
+        conf.post_fork(server, worker)
+
+        class StubConn:
+            pass
+
+        stub = StubConn()
+        stub.cfg = MagicMock(is_ssl=True)
+        stub.client = ("10.0.0.7", 5555)
+        reset_err = OSError(errno.ECONNRESET, "Connection reset by peer")
+        stub.parser = MagicMock()
+        stub.parser.__next__ = MagicMock(side_effect=reset_err)
+
+        gthread.TConn.init(stub)
+
+        server.log.reset_mock()
+        with pytest.raises(OSError):
+            next(stub.parser)
+
+        assert server.log.warning.called
+        fmt = server.log.warning.call_args[0][0]
+        assert "disconnected during TLS" in fmt
+
+    def test_parser_wrapper_skips_non_ssl(self, conf):
+        """When ``cfg.is_ssl`` is False, the parser should NOT be wrapped."""
+        import gunicorn.workers.gthread as gthread
+
+        server = MagicMock()
+        worker = MagicMock()
+        worker.cfg.do_handshake_on_connect = True
+
+        gthread.TConn.init = lambda self: None
+        conf.post_fork(server, worker)
+
+        class StubConn:
+            pass
+
+        stub = StubConn()
+        stub.cfg = MagicMock(is_ssl=False)
+        stub.client = ("10.0.0.8", 1234)
+        original_parser = MagicMock()
+        stub.parser = original_parser
+
+        gthread.TConn.init(stub)
+
+        assert stub.parser is original_parser
+
+    def test_diagnostic_debug_log_in_ssl_wrap_socket(self, conf):
+        """The patched ssl_wrap_socket should emit a DEBUG log on every
+        call showing the do_handshake_on_connect value."""
+        import gunicorn.sock as gsock
+
+        # Replace with a mock that succeeds
+        gsock.ssl_wrap_socket = MagicMock(return_value=MagicMock())
+
+        server = MagicMock()
+        conf.post_fork(server, MagicMock())
+
+        mock_conf = MagicMock()
+        mock_conf.do_handshake_on_connect = True
+        gsock.ssl_wrap_socket(MagicMock(), mock_conf)
+
+        assert server.log.debug.called
+        fmt = server.log.debug.call_args[0][0]
+        assert "ssl_wrap_socket called" in fmt
 
 
 # ===========================================================================
@@ -323,18 +500,37 @@ class TestGunicornSubprocessTls:
         assert "TLS handshake failure logging enabled" in stderr, (
             f"post_fork confirmation not found in stderr:\n{stderr}"
         )
+        assert "do_handshake_on_connect" in stderr, (
+            f"Expected do_handshake_on_connect diagnostic in stderr:\n{stderr}"
+        )
 
     def test_handshake_failure_produces_warning(self, tmp_path):
         """When a client rejects the server certificate, Gunicorn should
-        log 'TLS handshake failed' at WARNING level."""
+        log a TLS failure at WARNING level (verified by the ``[WARNING]``
+        tag appearing on the same line as the TLS error message)."""
         _, _, _, stderr = self._run_gunicorn_with_bad_client(
             tmp_path, trigger_handshake=True,
         )
         assert "TLS handshake failure logging enabled" in stderr, (
             f"post_fork hook did not fire. stderr:\n{stderr}"
         )
-        assert "TLS handshake failed" in stderr, (
-            f"Expected 'TLS handshake failed' in Gunicorn stderr:\n{stderr}"
+        # Verify the actual [WARNING] log level tag appears on the same
+        # line as the TLS failure message. Layer 1 produces
+        # "TLS handshake failed" and Layer 3 produces "TLS error from"
+        # or "disconnected during TLS".
+        tls_patterns = (
+            "TLS handshake failed",
+            "TLS error from",
+            "disconnected during TLS",
+        )
+        warning_lines = [
+            line for line in stderr.splitlines()
+            if "[WARNING]" in line
+            and any(pat in line for pat in tls_patterns)
+        ]
+        assert warning_lines, (
+            f"Expected a [WARNING] line containing a TLS failure message "
+            f"in Gunicorn stderr:\n{stderr}"
         )
 
     # --- Helper ---

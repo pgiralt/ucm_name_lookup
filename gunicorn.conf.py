@@ -15,6 +15,7 @@ HTTP with prominent security warnings.
 Any setting here can be overridden via ``GUNICORN_CMD_ARGS``.
 """
 
+import errno
 import logging
 import os
 import secrets
@@ -240,18 +241,29 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
         _mtls_enabled = True
 
     # --- TLS handshake failure logging & TLSv1.2 enforcement ---
-    # Gunicorn defaults to do_handshake_on_connect=False, which means
-    # the TLS handshake happens lazily during the first HTTP read inside
-    # the gthread worker's handle() method. Errors from the lazy
-    # handshake are caught at DEBUG level, making TLS failures invisible
-    # in production logs.
+    # Gunicorn's gthread worker catches TLS errors at DEBUG level in
+    # its handle() method, making failures invisible in production.
     #
-    # To surface these failures we:
-    #   1. Set do_handshake_on_connect=True so the handshake runs during
-    #      ssl_wrap_socket() where we can intercept it.
-    #   2. In post_fork, monkey-patch gunicorn.sock.ssl_wrap_socket and
-    #      wrap enqueue_req — both in the worker process where Gunicorn's
-    #      logger (server.log) is fully initialised.
+    # We use three layers of defence to surface these errors:
+    #
+    #   Layer 1 — ssl_wrap_socket patch (all worker types)
+    #     Catches errors during the eager handshake when
+    #     do_handshake_on_connect=True.
+    #
+    #   Layer 2 — enqueue_req wrapper (gthread only)
+    #     Prevents unhandled handshake exceptions from crashing the
+    #     gthread event-loop thread.
+    #
+    #   Layer 3 — HTTP parser wrapper (gthread only)
+    #     Catches TLS errors during lazy handshakes that happen inside
+    #     handle() → next(conn.parser). The wrapper logs at WARNING
+    #     before re-raising, so handle() still performs its cleanup.
+    #     This is the critical fallback: if do_handshake_on_connect
+    #     is not applied for any reason, this layer still catches
+    #     the error.
+    #
+    # All three patches are applied in post_fork where server.log
+    # (the Gunicorn Logger) is fully initialised with handlers.
     do_handshake_on_connect = True
 
     def ssl_context(conf, default_ssl_context_factory):
@@ -260,16 +272,17 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
         return ctx
 
     def post_fork(server, worker):
-        # --- Monkey-patch gunicorn.sock.ssl_wrap_socket ---
-        # This runs inside each worker process after fork, when
-        # server.log (the Gunicorn Logger) is fully configured with
-        # handlers. Using server.log guarantees the WARNING reaches
-        # the console/file handlers that logconfig_dict set up.
         import gunicorn.sock as _gsock
 
+        # ---- Layer 1: patch gunicorn.sock.ssl_wrap_socket ----------
         _orig_ssl_wrap = _gsock.ssl_wrap_socket
 
         def _logging_ssl_wrap_socket(sock, conf):
+            server.log.debug(
+                "ssl_wrap_socket called "
+                "(do_handshake_on_connect=%s)",
+                conf.do_handshake_on_connect,
+            )
             try:
                 return _orig_ssl_wrap(sock, conf)
             except ssl.SSLError as exc:
@@ -298,23 +311,18 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
 
         _gsock.ssl_wrap_socket = _logging_ssl_wrap_socket
 
-        # --- Protect the gthread event loop from handshake errors ---
-        # With do_handshake_on_connect=True the TLS handshake runs
-        # inside conn.init(), called from enqueue_req() on the main
-        # event-loop thread. Neither enqueue_req nor the selector
-        # callback have try/except, so an unhandled exception would
-        # crash the worker. We wrap enqueue_req to catch, clean up,
-        # and keep the worker alive.
+        # ---- gthread-specific layers (2 & 3) ----------------------
         if not hasattr(worker, "enqueue_req"):
-            return  # only applies to gthread workers
+            server.log.info("TLS handshake failure logging enabled")
+            return
 
+        # ---- Layer 2: wrap enqueue_req -----------------------------
         _original_enqueue = worker.enqueue_req
 
         def _safe_enqueue_req(conn):
             try:
                 _original_enqueue(conn)
             except (ssl.SSLError, OSError):
-                # Already logged at WARNING by _logging_ssl_wrap_socket.
                 try:
                     conn.close()
                 except Exception:
@@ -322,7 +330,85 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
                 worker.nr_conns -= 1
 
         worker.enqueue_req = _safe_enqueue_req
-        server.log.info("TLS handshake failure logging enabled")
+
+        # ---- Layer 3: wrap TConn's HTTP parser ---------------------
+        # The gthread handle() method does:
+        #     req = next(conn.parser)
+        # If do_handshake_on_connect is not effective, the TLS
+        # handshake happens lazily here. handle() catches
+        # ssl.SSLError and EnvironmentError at DEBUG level.
+        # Our wrapper intercepts them first at WARNING.
+
+        class _TlsLoggingParser:
+            """Proxy around Gunicorn's HTTP RequestParser that logs
+            TLS errors at WARNING before they reach handle()."""
+
+            __slots__ = ("_parser", "_log", "_client")
+
+            def __init__(self, parser, log, client):
+                self._parser = parser
+                self._log = log
+                self._client = client
+
+            def _peer_str(self):
+                try:
+                    return f"{self._client[0]}:{self._client[1]}"
+                except (IndexError, TypeError):
+                    return "<unknown>"
+
+            def __next__(self):
+                try:
+                    return next(self._parser)
+                except ssl.SSLError as exc:
+                    if exc.args[0] != ssl.SSL_ERROR_EOF:
+                        self._log.warning(
+                            "TLS error from %s: %s",
+                            self._peer_str(), exc,
+                        )
+                    raise
+                except OSError as exc:
+                    if exc.errno in (
+                        errno.ECONNRESET,
+                        errno.ENOTCONN,
+                        errno.EPIPE,
+                    ):
+                        self._log.warning(
+                            "Client %s disconnected during TLS "
+                            "(may have rejected the server "
+                            "certificate): %s",
+                            self._peer_str(), exc,
+                        )
+                    raise
+
+            def __iter__(self):
+                return self
+
+            def __getattr__(self, name):
+                return getattr(self._parser, name)
+
+        try:
+            import gunicorn.workers.gthread as _gthread
+        except ImportError:
+            _gthread = None
+
+        if _gthread is not None:
+            _orig_tconn_init = _gthread.TConn.init
+
+            def _logging_tconn_init(self):
+                _orig_tconn_init(self)
+                if self.cfg.is_ssl and self.parser is not None:
+                    self.parser = _TlsLoggingParser(
+                        self.parser, server.log, self.client,
+                    )
+
+            _gthread.TConn.init = _logging_tconn_init
+
+        server.log.info(
+            "TLS handshake failure logging enabled "
+            "(do_handshake_on_connect=%s, parser_wrapper=%s)",
+            worker.cfg.do_handshake_on_connect,
+            _gthread is not None,
+        )
 
     # --- TLS debug diagnostics (only when LOG_LEVEL=DEBUG) ---
     if _log_level == "DEBUG":
