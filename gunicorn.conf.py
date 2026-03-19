@@ -240,13 +240,19 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
         _mtls_enabled = True
 
     # --- TLS handshake failure logging & TLSv1.2 enforcement ---
-    # Gunicorn's ssl_context hook (added in 21.0) receives the config
-    # and a factory that builds the default SSLContext from certfile,
-    # keyfile, ca_certs, and cert_reqs. We customise it to:
-    #   1. Enforce TLSv1.2 as the minimum protocol version.
-    #   2. Wrap the context's wrap_socket so every failed TLS
-    #      handshake is logged at WARNING with the peer address and
-    #      the OpenSSL reason string.
+    # Gunicorn defaults to do_handshake_on_connect=False, which means
+    # wrap_socket() returns immediately and the actual TLS handshake
+    # happens lazily during the first read/write. The gthread worker
+    # catches errors from the lazy handshake at DEBUG level, making TLS
+    # failures invisible in production logs.
+    #
+    # To surface these failures, we set do_handshake_on_connect=True so
+    # the handshake happens during wrap_socket() where our wrapper can
+    # intercept and log it at WARNING. A post_fork hook (below) protects
+    # the gthread worker's enqueue_req from crashing the event loop if
+    # the handshake raises.
+    do_handshake_on_connect = True
+
     _tls_logger = logging.getLogger("gunicorn.error")
 
     def ssl_context(conf, default_ssl_context_factory):
@@ -288,6 +294,33 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
 
         ctx.wrap_socket = _logging_wrap_socket  # type: ignore[assignment]
         return ctx
+
+    # --- Protect the gthread event loop from handshake errors ---
+    # With do_handshake_on_connect=True the TLS handshake runs inside
+    # conn.init(), which is called from enqueue_req() on the main event
+    # loop thread. Neither enqueue_req nor its caller have try/except,
+    # so an unhandled exception would crash the worker. We patch
+    # enqueue_req in post_fork to catch and log the error cleanly.
+    def post_fork(server, worker):
+        if not hasattr(worker, "enqueue_req"):
+            return  # only applies to gthread workers
+
+        _original_enqueue = worker.enqueue_req
+
+        def _safe_enqueue_req(conn):
+            try:
+                _original_enqueue(conn)
+            except (ssl.SSLError, OSError):
+                # Already logged at WARNING by the wrap_socket wrapper.
+                # Clean up the connection and decrement the counter so
+                # the worker does not leak connection slots.
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                worker.nr_conns -= 1
+
+        worker.enqueue_req = _safe_enqueue_req
 
     # --- TLS debug diagnostics (only when LOG_LEVEL=DEBUG) ---
     if _log_level == "DEBUG":
