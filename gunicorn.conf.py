@@ -225,13 +225,9 @@ def _start_insecure_mode_warning() -> None:
 
 
 if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
+    certfile = _cert
+    keyfile = _key
     bind = "0.0.0.0:443"
-
-    # Build the SSLContext manually so we can enforce TLSv1.2+ and
-    # intercept handshake failures with actionable log messages.
-    _ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    _ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    _ctx.load_cert_chain(_cert, _key)
 
     # Enable mTLS if the CA bundle is available.
     # CERT_REQUIRED means all TLS connections must present a valid
@@ -239,35 +235,42 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
     # entries in config.yaml must be CA certificates, not leaf certs.
     _mtls_enabled = False
     if _bundle_path and os.path.isfile(_bundle_path):
-        _ctx.load_verify_locations(_bundle_path)
-        _ctx.verify_mode = ssl.CERT_REQUIRED
+        ca_certs = _bundle_path
+        cert_reqs = ssl.CERT_REQUIRED
         _mtls_enabled = True
 
-    # --- TLS handshake failure logging ---
-    # Gunicorn's gthread worker catches ssl.SSLError during
-    # wrap_socket but often logs it at DEBUG level or swallows it
-    # entirely. Wrapping the context's wrap_socket ensures every
-    # failed handshake is logged at WARNING with the peer address
-    # and the OpenSSL reason string.
+    # --- TLS handshake failure logging & TLSv1.2 enforcement ---
+    # Gunicorn's ssl_context hook (added in 21.0) receives the config
+    # and a factory that builds the default SSLContext from certfile,
+    # keyfile, ca_certs, and cert_reqs. We customise it to:
+    #   1. Enforce TLSv1.2 as the minimum protocol version.
+    #   2. Wrap the context's wrap_socket so every failed TLS
+    #      handshake is logged at WARNING with the peer address and
+    #      the OpenSSL reason string.
     _tls_logger = logging.getLogger("gunicorn.error")
-    _original_wrap_socket = _ctx.wrap_socket
 
-    def _logging_wrap_socket(sock, *args, **kwargs):
-        try:
-            return _original_wrap_socket(sock, *args, **kwargs)
-        except ssl.SSLError as exc:
+    def ssl_context(conf, default_ssl_context_factory):
+        ctx = default_ssl_context_factory()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+
+        _original_wrap_socket = ctx.wrap_socket
+
+        def _logging_wrap_socket(sock, *args, **kwargs):
             try:
-                peer = sock.getpeername()
-                peer_str = f"{peer[0]}:{peer[1]}"
-            except (OSError, IndexError):
-                peer_str = "<unknown>"
-            _tls_logger.warning(
-                "TLS handshake failed from %s: %s", peer_str, exc
-            )
-            raise
+                return _original_wrap_socket(sock, *args, **kwargs)
+            except ssl.SSLError as exc:
+                try:
+                    peer = sock.getpeername()
+                    peer_str = f"{peer[0]}:{peer[1]}"
+                except (OSError, IndexError):
+                    peer_str = "<unknown>"
+                _tls_logger.warning(
+                    "TLS handshake failed from %s: %s", peer_str, exc
+                )
+                raise
 
-    _ctx.wrap_socket = _logging_wrap_socket  # type: ignore[assignment]
-    ssl_context = _ctx
+        ctx.wrap_socket = _logging_wrap_socket  # type: ignore[assignment]
+        return ctx
 
     # --- TLS debug diagnostics (only when LOG_LEVEL=DEBUG) ---
     if _log_level == "DEBUG":
@@ -279,7 +282,9 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
         print(f"  min_ver   = TLSv1.2")
         if _mtls_enabled:
             try:
-                _dbg_ca_list = _ctx.get_ca_certs()
+                _dbg_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                _dbg_ctx.load_verify_locations(_bundle_path)
+                _dbg_ca_list = _dbg_ctx.get_ca_certs()
                 print(
                     f"[DEBUG] CA bundle contains "
                     f"{len(_dbg_ca_list)} CA certificate(s):"
