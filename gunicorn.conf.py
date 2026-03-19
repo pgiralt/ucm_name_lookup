@@ -322,7 +322,21 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
         def _safe_enqueue_req(conn):
             try:
                 _original_enqueue(conn)
-            except (ssl.SSLError, OSError):
+            except (ssl.SSLError, OSError) as exc:
+                server.log.debug(
+                    "enqueue_req caught %s: %s",
+                    type(exc).__name__, exc,
+                )
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                worker.nr_conns -= 1
+            except Exception as exc:
+                server.log.warning(
+                    "Unexpected error in enqueue_req: %s: %s",
+                    type(exc).__name__, exc,
+                )
                 try:
                     conn.close()
                 except Exception:
@@ -338,17 +352,30 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
         # handshake happens lazily here. handle() catches
         # ssl.SSLError and EnvironmentError at DEBUG level.
         # Our wrapper intercepts them first at WARNING.
+        #
+        # Additionally, when a client completes the TLS handshake
+        # but then disconnects without sending HTTP data (e.g. UCM
+        # rejects the server certificate post-handshake), handle()
+        # sees StopIteration or SSL_ERROR_EOF and logs at DEBUG.
+        # We detect this on the *first* next() call and escalate
+        # to WARNING.
+
+        try:
+            from gunicorn.http.errors import NoMoreData as _NoMoreData
+        except ImportError:
+            _NoMoreData = None
 
         class _TlsLoggingParser:
             """Proxy around Gunicorn's HTTP RequestParser that logs
             TLS errors at WARNING before they reach handle()."""
 
-            __slots__ = ("_parser", "_log", "_client")
+            __slots__ = ("_parser", "_log", "_client", "_first")
 
             def __init__(self, parser, log, client):
                 self._parser = parser
                 self._log = log
                 self._client = client
+                self._first = True
 
             def _peer_str(self):
                 try:
@@ -357,13 +384,34 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
                     return "<unknown>"
 
             def __next__(self):
+                is_first = self._first
+                self._first = False
                 try:
                     return next(self._parser)
                 except ssl.SSLError as exc:
-                    if exc.args[0] != ssl.SSL_ERROR_EOF:
+                    if exc.args[0] == ssl.SSL_ERROR_EOF:
+                        if is_first:
+                            self._log.warning(
+                                "Client %s established TLS but "
+                                "disconnected without sending "
+                                "data (SSL EOF — may have rejected "
+                                "the server certificate)",
+                                self._peer_str(),
+                            )
+                    else:
                         self._log.warning(
                             "TLS error from %s: %s",
                             self._peer_str(), exc,
+                        )
+                    raise
+                except StopIteration:
+                    if is_first:
+                        self._log.warning(
+                            "Client %s established TLS but "
+                            "disconnected without sending "
+                            "data (may have rejected the server "
+                            "certificate)",
+                            self._peer_str(),
                         )
                     raise
                 except OSError as exc:
@@ -378,6 +426,19 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
                             "certificate): %s",
                             self._peer_str(), exc,
                         )
+                    raise
+                except Exception:
+                    if is_first and _NoMoreData is not None:
+                        import sys
+                        exc_type = sys.exc_info()[0]
+                        if issubclass(exc_type, _NoMoreData):
+                            self._log.warning(
+                                "Client %s established TLS but "
+                                "disconnected without sending "
+                                "complete data (may have rejected "
+                                "the server certificate)",
+                                self._peer_str(),
+                            )
                     raise
 
             def __iter__(self):

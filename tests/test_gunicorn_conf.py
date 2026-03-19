@@ -7,10 +7,12 @@ Validates that the ``post_fork`` hook in ``gunicorn.conf.py`` correctly:
 2. Layer 2: Wraps the gthread worker's ``enqueue_req`` to prevent
    event-loop crashes when handshake errors raise.
 3. Layer 3: Wraps ``TConn.init`` to install a ``_TlsLoggingParser`` proxy
-   around the HTTP parser, catching lazy-handshake TLS errors that
-   ``handle()`` would otherwise swallow at DEBUG level.
+   around the HTTP parser, catching lazy-handshake TLS errors and
+   post-handshake disconnects that ``handle()`` would otherwise swallow
+   at DEBUG level.
 4. Produces visible WARNING output when a real Gunicorn process encounters
-   a TLS handshake failure from a client that rejects the server certificate.
+   a TLS handshake failure or a post-handshake disconnect from a client
+   that rejects the server certificate.
 """
 
 import errno
@@ -371,16 +373,16 @@ class TestPostForkHook:
         peer = server.log.warning.call_args[0][1]
         assert peer == "10.0.0.5:9999"
 
-    def test_parser_wrapper_skips_ssl_eof(self, conf):
-        """SSL_ERROR_EOF should NOT be logged at WARNING (it is a normal
-        clean close handled by handle() at DEBUG)."""
+    def test_parser_wrapper_logs_ssl_eof_on_first_call(self, conf):
+        """SSL_ERROR_EOF on the *first* next() call means the client
+        completed TLS but disconnected without sending HTTP data.
+        This should be logged at WARNING."""
         import gunicorn.workers.gthread as gthread
 
         server = MagicMock()
         worker = MagicMock()
         worker.cfg.do_handshake_on_connect = True
 
-        # Set TConn.init to no-op so post_fork captures that
         gthread.TConn.init = lambda self: None
         conf.post_fork(server, worker)
 
@@ -399,6 +401,119 @@ class TestPostForkHook:
 
         server.log.reset_mock()
         with pytest.raises(ssl.SSLError):
+            next(stub.parser)
+
+        assert server.log.warning.called
+        fmt = server.log.warning.call_args[0][0]
+        assert "established TLS but disconnected" in fmt
+
+    def test_parser_wrapper_skips_ssl_eof_on_subsequent_call(self, conf):
+        """SSL_ERROR_EOF on a subsequent (keepalive) call is a normal
+        clean close and should NOT be logged at WARNING."""
+        import gunicorn.workers.gthread as gthread
+
+        server = MagicMock()
+        worker = MagicMock()
+        worker.cfg.do_handshake_on_connect = True
+
+        gthread.TConn.init = lambda self: None
+        conf.post_fork(server, worker)
+
+        class StubConn:
+            pass
+
+        stub = StubConn()
+        stub.cfg = MagicMock(is_ssl=True)
+        stub.client = ("10.0.0.5", 9999)
+        # First call succeeds (simulates a successful first request)
+        call_count = 0
+        def _side_effect(self_mock):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return MagicMock()  # successful first request
+            raise ssl.SSLError(ssl.SSL_ERROR_EOF, "EOF occurred")
+        stub.parser = MagicMock()
+        stub.parser.__next__ = _side_effect
+
+        gthread.TConn.init(stub)
+
+        # First call succeeds — sets _first to False
+        next(stub.parser)
+
+        server.log.reset_mock()
+        with pytest.raises(ssl.SSLError):
+            next(stub.parser)
+
+        server.log.warning.assert_not_called()
+
+    def test_parser_wrapper_logs_stop_iteration_on_first_call(self, conf):
+        """StopIteration on the first next() call means the client
+        completed TLS but closed without sending HTTP data."""
+        import gunicorn.workers.gthread as gthread
+
+        server = MagicMock()
+        worker = MagicMock()
+        worker.cfg.do_handshake_on_connect = True
+
+        gthread.TConn.init = lambda self: None
+        conf.post_fork(server, worker)
+
+        class StubConn:
+            pass
+
+        stub = StubConn()
+        stub.cfg = MagicMock(is_ssl=True)
+        stub.client = ("10.0.0.9", 7777)
+        stub.parser = MagicMock()
+        stub.parser.__next__ = MagicMock(side_effect=StopIteration)
+
+        gthread.TConn.init(stub)
+
+        server.log.reset_mock()
+        with pytest.raises(StopIteration):
+            next(stub.parser)
+
+        assert server.log.warning.called
+        fmt = server.log.warning.call_args[0][0]
+        assert "established TLS but disconnected" in fmt
+        peer = server.log.warning.call_args[0][1]
+        assert peer == "10.0.0.9:7777"
+
+    def test_parser_wrapper_skips_stop_iteration_on_subsequent_call(self, conf):
+        """StopIteration on a subsequent call is a normal keepalive
+        close and should NOT be logged at WARNING."""
+        import gunicorn.workers.gthread as gthread
+
+        server = MagicMock()
+        worker = MagicMock()
+        worker.cfg.do_handshake_on_connect = True
+
+        gthread.TConn.init = lambda self: None
+        conf.post_fork(server, worker)
+
+        class StubConn:
+            pass
+
+        stub = StubConn()
+        stub.cfg = MagicMock(is_ssl=True)
+        stub.client = ("10.0.0.9", 7777)
+        call_count = 0
+        def _side_effect(self_mock):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return MagicMock()
+            raise StopIteration
+        stub.parser = MagicMock()
+        stub.parser.__next__ = _side_effect
+
+        gthread.TConn.init(stub)
+
+        next(stub.parser)  # first call succeeds
+
+        server.log.reset_mock()
+        with pytest.raises(StopIteration):
             next(stub.parser)
 
         server.log.warning.assert_not_called()
@@ -516,12 +631,14 @@ class TestGunicornSubprocessTls:
         )
         # Verify the actual [WARNING] log level tag appears on the same
         # line as the TLS failure message. Layer 1 produces
-        # "TLS handshake failed" and Layer 3 produces "TLS error from"
-        # or "disconnected during TLS".
+        # "TLS handshake failed", Layer 3 produces "TLS error from",
+        # "disconnected during TLS", or "established TLS but
+        # disconnected" (post-handshake rejection).
         tls_patterns = (
             "TLS handshake failed",
             "TLS error from",
             "disconnected during TLS",
+            "established TLS but disconnected",
         )
         warning_lines = [
             line for line in stderr.splitlines()
@@ -533,11 +650,37 @@ class TestGunicornSubprocessTls:
             f"in Gunicorn stderr:\n{stderr}"
         )
 
+    def test_post_handshake_disconnect_produces_warning(self, tmp_path):
+        """When a client completes TLS but disconnects without sending
+        HTTP data (post-handshake certificate rejection), Gunicorn
+        should log a WARNING with 'established TLS but disconnected'."""
+        _, _, _, stderr = self._run_gunicorn_with_bad_client(
+            tmp_path, trigger_handshake=False,
+            post_handshake_disconnect=True,
+        )
+        assert "TLS handshake failure logging enabled" in stderr, (
+            f"post_fork hook did not fire. stderr:\n{stderr}"
+        )
+        warning_lines = [
+            line for line in stderr.splitlines()
+            if "[WARNING]" in line
+            and "established TLS but disconnected" in line
+        ]
+        assert warning_lines, (
+            f"Expected a [WARNING] line containing "
+            f"'established TLS but disconnected' "
+            f"in Gunicorn stderr:\n{stderr}"
+        )
+
     # --- Helper ---
 
-    def _run_gunicorn_with_bad_client(self, tmp_path, trigger_handshake):
+    def _run_gunicorn_with_bad_client(
+        self, tmp_path, trigger_handshake, post_handshake_disconnect=False,
+    ):
         """Start Gunicorn with TLS and optionally trigger a handshake
-        failure. Returns (cert_path, key_path, port, full_stderr)."""
+        failure or a post-handshake disconnect.
+
+        Returns (cert_path, key_path, port, full_stderr)."""
         # --- Generate two separate CAs so the client rejects the server ---
         srv_ca_cert, srv_ca_key = generate_ca(cn="Subprocess Server CA")
         cli_ca_cert, cli_ca_key = generate_ca(cn="Subprocess Untrusted CA")
@@ -549,6 +692,7 @@ class TestGunicornSubprocessTls:
         cert_path = write_pem_cert(srv_cert, tmp_path / "srv.pem")
         key_path = write_pem_key(srv_key, tmp_path / "srv-key.pem")
         cli_ca_path = write_pem_cert(cli_ca_cert, tmp_path / "cli-ca.pem")
+        srv_ca_path = write_pem_cert(srv_ca_cert, tmp_path / "srv-ca.pem")
 
         # Minimal phone directory so main.py doesn't warn about missing file
         csv_file = tmp_path / "directory.csv"
@@ -621,6 +765,25 @@ class TestGunicornSubprocessTls:
                     pass
 
                 # Give the worker time to process and log
+                time.sleep(2)
+
+            if post_handshake_disconnect:
+                # Client trusts the RIGHT CA → TLS succeeds → then
+                # closes without sending any HTTP data.
+                client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                client_ctx.load_verify_locations(srv_ca_path)
+                try:
+                    sock = socket.create_connection(
+                        ("127.0.0.1", port), timeout=5,
+                    )
+                    ss = client_ctx.wrap_socket(
+                        sock, server_hostname="localhost",
+                    )
+                    ss.close()
+                except (ssl.SSLError, ConnectionResetError,
+                        BrokenPipeError, OSError):
+                    pass
+
                 time.sleep(2)
 
         finally:
