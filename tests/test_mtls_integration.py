@@ -239,18 +239,26 @@ class TestMtlsHandshake:
 # ===========================================================================
 
 class TestTlsHandshakeLogging:
-    """Verify the wrap_socket pattern used in gunicorn.conf.py logs
-    TLS handshake failures at WARNING level with peer information."""
+    """Verify the ssl_wrap_socket monkey-patch used in gunicorn.conf.py
+    logs TLS handshake failures at WARNING level with peer information.
+
+    Production flow: gunicorn.sock.ssl_wrap_socket is replaced by
+    _logging_ssl_wrap_socket which wraps the original and catches
+    ssl.SSLError / OSError, logging at WARNING before re-raising.
+    These tests replicate that pattern with a local callable wrapper.
+    """
 
     @staticmethod
-    def _apply_wrap_socket_logging(ctx: ssl.SSLContext) -> None:
-        """Apply the same wrap_socket wrapper that gunicorn.conf.py uses."""
+    def _make_logging_wrap(ctx: ssl.SSLContext):
+        """Build a ``(sock) -> SSLSocket`` callable that mirrors the
+        production _logging_ssl_wrap_socket wrapper. Returns the
+        callable and a reference list for any errors it catches."""
         tls_logger = logging.getLogger("gunicorn.error")
-        original_wrap_socket = ctx.wrap_socket
 
-        def _logging_wrap_socket(sock, *args, **kwargs):
+        def _wrap(sock):
+            """Wrap *sock* with TLS (server-side) and log failures."""
             try:
-                return original_wrap_socket(sock, *args, **kwargs)
+                return ctx.wrap_socket(sock, server_side=True)
             except ssl.SSLError as exc:
                 try:
                     peer = sock.getpeername()
@@ -275,17 +283,14 @@ class TestTlsHandshakeLogging:
                 )
                 raise
 
-        ctx.wrap_socket = _logging_wrap_socket  # type: ignore[assignment]
+        return _wrap
 
     def test_no_client_cert_logs_warning(self, mtls_server, caplog):
         """When mTLS handshake fails because no client cert is presented,
         a WARNING should be logged with peer address and SSL error."""
         server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         server_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        ca_path = mtls_server["ca_path"]
 
-        # Reuse the server cert from mtls_server fixture — we just need
-        # a listening socket that requires client certs.
         ca_cert, ca_key = generate_ca(cn="Handshake Log CA")
         srv_cert, srv_key = generate_leaf(
             ca_cert, ca_key, cn="localhost",
@@ -299,9 +304,8 @@ class TestTlsHandshakeLogging:
         server_ctx.load_cert_chain(srv_cert_path, srv_key_path)
         server_ctx.load_verify_locations(ca_path)
         server_ctx.verify_mode = ssl.CERT_REQUIRED
-        self._apply_wrap_socket_logging(server_ctx)
+        wrap = self._make_logging_wrap(server_ctx)
 
-        # Start a minimal TLS server on an ephemeral port.
         srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv_sock.bind(("127.0.0.1", 0))
@@ -314,7 +318,7 @@ class TestTlsHandshakeLogging:
             try:
                 conn, _ = srv_sock.accept()
                 try:
-                    server_ctx.wrap_socket(conn, server_side=True)
+                    wrap(conn)
                 except ssl.SSLError as e:
                     handshake_error.append(e)
                     conn.close()
@@ -327,8 +331,6 @@ class TestTlsHandshakeLogging:
         accept_thread.start()
 
         # Connect without a client cert — handshake will fail.
-        # The client may raise ssl.SSLError, ConnectionResetError, or
-        # BrokenPipeError depending on timing and platform.
         client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         client_ctx.load_verify_locations(ca_path)
         with caplog.at_level(logging.WARNING, logger="gunicorn.error"):
@@ -345,8 +347,6 @@ class TestTlsHandshakeLogging:
             accept_thread.join(timeout=5)
 
         assert len(handshake_error) == 1
-        # The peer address may be 127.0.0.1:<port> or <unknown> depending
-        # on whether the socket is still connected when getpeername() runs.
         assert any(
             "TLS handshake failed" in rec.message
             for rec in caplog.records
@@ -373,7 +373,7 @@ class TestTlsHandshakeLogging:
         server_ctx.load_cert_chain(srv_cert_path, srv_key_path)
         server_ctx.load_verify_locations(ca_path)
         server_ctx.verify_mode = ssl.CERT_REQUIRED
-        self._apply_wrap_socket_logging(server_ctx)
+        wrap = self._make_logging_wrap(server_ctx)
 
         srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -386,7 +386,7 @@ class TestTlsHandshakeLogging:
         def _accept():
             try:
                 conn, _ = srv_sock.accept()
-                ssl_conn = server_ctx.wrap_socket(conn, server_side=True)
+                ssl_conn = wrap(conn)
                 wrapped_conn.append(ssl_conn)
                 ssl_conn.close()
             except OSError:
@@ -421,8 +421,6 @@ class TestTlsHandshakeLogging:
         """When the client rejects the server certificate and drops the
         connection, the server should log a WARNING indicating the client
         disconnected (may have rejected the server certificate)."""
-        # Create two independent CAs — the client will NOT trust the
-        # server's CA, simulating UCM rejecting an untrusted server cert.
         srv_ca_cert, srv_ca_key = generate_ca(cn="Server CA")
         cli_ca_cert, cli_ca_key = generate_ca(cn="Client CA")
 
@@ -437,7 +435,7 @@ class TestTlsHandshakeLogging:
         server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         server_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         server_ctx.load_cert_chain(srv_cert_path, srv_key_path)
-        self._apply_wrap_socket_logging(server_ctx)
+        wrap = self._make_logging_wrap(server_ctx)
 
         srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -451,7 +449,7 @@ class TestTlsHandshakeLogging:
             try:
                 conn, _ = srv_sock.accept()
                 try:
-                    server_ctx.wrap_socket(conn, server_side=True)
+                    wrap(conn)
                 except (ssl.SSLError, OSError) as e:
                     handshake_error.append(e)
                     conn.close()
