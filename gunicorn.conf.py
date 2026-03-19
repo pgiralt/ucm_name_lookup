@@ -249,64 +249,62 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
     # To surface these failures we:
     #   1. Set do_handshake_on_connect=True so the handshake runs during
     #      ssl_wrap_socket() where we can intercept it.
-    #   2. Monkey-patch gunicorn.sock.ssl_wrap_socket — the actual
-    #      function the gthread worker calls — to log errors at WARNING.
-    #   3. Protect enqueue_req via post_fork so a handshake error does
-    #      not crash the worker's main event loop.
+    #   2. In post_fork, monkey-patch gunicorn.sock.ssl_wrap_socket and
+    #      wrap enqueue_req — both in the worker process where Gunicorn's
+    #      logger (server.log) is fully initialised.
     do_handshake_on_connect = True
-
-    _tls_logger = logging.getLogger("gunicorn.error")
 
     def ssl_context(conf, default_ssl_context_factory):
         ctx = default_ssl_context_factory()
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         return ctx
 
-    # --- Monkey-patch gunicorn.sock.ssl_wrap_socket ---
-    # This is the function the gthread worker calls (via
-    # ``from .. import sock; sock.ssl_wrap_socket(...)``).
-    # Replacing it on the module object ensures every worker — which
-    # inherits the module after fork — uses the patched version.
-    import gunicorn.sock as _gsock  # noqa: E402
-
-    _orig_ssl_wrap_socket = _gsock.ssl_wrap_socket
-
-    def _logging_ssl_wrap_socket(sock, conf):
-        try:
-            return _orig_ssl_wrap_socket(sock, conf)
-        except ssl.SSLError as exc:
-            try:
-                peer = sock.getpeername()
-                peer_str = f"{peer[0]}:{peer[1]}"
-            except (OSError, IndexError):
-                peer_str = "<unknown>"
-            _tls_logger.warning(
-                "TLS handshake failed from %s: %s", peer_str, exc
-            )
-            raise
-        except OSError as exc:
-            try:
-                peer = sock.getpeername()
-                peer_str = f"{peer[0]}:{peer[1]}"
-            except (OSError, IndexError):
-                peer_str = "<unknown>"
-            _tls_logger.warning(
-                "TLS handshake failed from %s "
-                "(client disconnected — may have rejected the "
-                "server certificate): %s",
-                peer_str, exc,
-            )
-            raise
-
-    _gsock.ssl_wrap_socket = _logging_ssl_wrap_socket
-
-    # --- Protect the gthread event loop from handshake errors ---
-    # With do_handshake_on_connect=True the TLS handshake runs inside
-    # conn.init(), which is called from enqueue_req() on the main event
-    # loop thread. Neither enqueue_req nor its caller have try/except,
-    # so an unhandled exception would crash the worker. We patch
-    # enqueue_req in post_fork to catch and log the error cleanly.
     def post_fork(server, worker):
+        # --- Monkey-patch gunicorn.sock.ssl_wrap_socket ---
+        # This runs inside each worker process after fork, when
+        # server.log (the Gunicorn Logger) is fully configured with
+        # handlers. Using server.log guarantees the WARNING reaches
+        # the console/file handlers that logconfig_dict set up.
+        import gunicorn.sock as _gsock
+
+        _orig_ssl_wrap = _gsock.ssl_wrap_socket
+
+        def _logging_ssl_wrap_socket(sock, conf):
+            try:
+                return _orig_ssl_wrap(sock, conf)
+            except ssl.SSLError as exc:
+                try:
+                    peer = sock.getpeername()
+                    peer_str = f"{peer[0]}:{peer[1]}"
+                except (OSError, IndexError):
+                    peer_str = "<unknown>"
+                server.log.warning(
+                    "TLS handshake failed from %s: %s", peer_str, exc
+                )
+                raise
+            except OSError as exc:
+                try:
+                    peer = sock.getpeername()
+                    peer_str = f"{peer[0]}:{peer[1]}"
+                except (OSError, IndexError):
+                    peer_str = "<unknown>"
+                server.log.warning(
+                    "TLS handshake failed from %s "
+                    "(client disconnected — may have rejected the "
+                    "server certificate): %s",
+                    peer_str, exc,
+                )
+                raise
+
+        _gsock.ssl_wrap_socket = _logging_ssl_wrap_socket
+
+        # --- Protect the gthread event loop from handshake errors ---
+        # With do_handshake_on_connect=True the TLS handshake runs
+        # inside conn.init(), called from enqueue_req() on the main
+        # event-loop thread. Neither enqueue_req nor the selector
+        # callback have try/except, so an unhandled exception would
+        # crash the worker. We wrap enqueue_req to catch, clean up,
+        # and keep the worker alive.
         if not hasattr(worker, "enqueue_req"):
             return  # only applies to gthread workers
 
@@ -317,8 +315,6 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
                 _original_enqueue(conn)
             except (ssl.SSLError, OSError):
                 # Already logged at WARNING by _logging_ssl_wrap_socket.
-                # Clean up the connection and decrement the counter so
-                # the worker does not leak connection slots.
                 try:
                     conn.close()
                 except Exception:
@@ -326,6 +322,7 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
                 worker.nr_conns -= 1
 
         worker.enqueue_req = _safe_enqueue_req
+        server.log.info("TLS handshake failure logging enabled")
 
     # --- TLS debug diagnostics (only when LOG_LEVEL=DEBUG) ---
     if _log_level == "DEBUG":
