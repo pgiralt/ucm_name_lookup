@@ -139,6 +139,29 @@ if not _insecure_mode and not _clusters:
     )
     sys.exit(1)
 
+# --- Require ca_bundle_path when clusters define ca_file ---
+# Without ca_bundle_path, the CA bundle is never generated and Gunicorn
+# cannot enable CERT_REQUIRED — meaning mTLS is silently inactive even
+# though clusters expect client certificates.
+if not _insecure_mode and isinstance(_clusters, dict):
+    _any_ca_file = any(
+        isinstance(cdata, dict) and cdata.get("ca_file")
+        for cdata in _clusters.values()
+    )
+    if _any_ca_file and not _bundle_path:
+        print(
+            "[ERROR] One or more clusters define 'ca_file' but "
+            "'ca_bundle_path' is not configured. Gunicorn needs "
+            "ca_bundle_path to generate the CA bundle for mTLS "
+            "(client certificate verification).\n"
+            f"  Add 'ca_bundle_path: certs/ca-bundle.pem' to "
+            f"{_config_path}\n"
+            "  (In Docker with certs/ mounted read-only, use a "
+            "writable path such as /tmp/ca-bundle.pem)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
 # --- PII obfuscation salt ---
 # Generate the HMAC salt once in the master process and expose it via an
 # environment variable so that every forked worker inherits the same value.
@@ -170,7 +193,16 @@ if _bundle_path and isinstance(_clusters, dict):
                         _out.write(_c)
                         if not _c.endswith("\n"):
                             _out.write("\n")
-        except OSError:
+        except OSError as _exc:
+            if not _insecure_mode:
+                print(
+                    f"[ERROR] Failed to generate CA bundle at "
+                    f"'{_bundle_path}': {_exc}\n"
+                    "  Ensure the path is writable or use a different "
+                    "ca_bundle_path.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             _bundle_path = ""
 
 # ---------------------------------------------------------------------------
@@ -239,6 +271,21 @@ if not _insecure_mode and os.path.isfile(_cert) and os.path.isfile(_key):
         ca_certs = _bundle_path
         cert_reqs = ssl.CERT_REQUIRED
         _mtls_enabled = True
+
+    if _mtls_enabled:
+        print(
+            "[INFO] Mutual TLS (mTLS) is ENABLED — client certificates "
+            "are required for all connections (ca_certs=%s)" % _bundle_path,
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "[INFO] TLS is enabled but mTLS is NOT active — client "
+            "certificates will not be verified. To enable mTLS, "
+            "configure ca_bundle_path and cluster ca_file entries "
+            "in %s" % _config_path,
+            file=sys.stderr,
+        )
 
     # --- TLS handshake failure logging & TLSv1.2 enforcement ---
     # Gunicorn's gthread worker catches TLS errors at DEBUG level in

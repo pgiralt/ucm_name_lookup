@@ -587,6 +587,15 @@ def _generate_ca_bundle(
             bundle_path,
         )
     except OSError as exc:
+        if not INSECURE_MODE:
+            logger.error(
+                "Failed to write CA bundle to '%s': %s  "
+                "Ensure the path is writable or use a different "
+                "ca_bundle_path.",
+                bundle_path,
+                exc,
+            )
+            sys.exit(1)
         logger.warning(
             "Could not write CA bundle to '%s': %s  "
             "You can manually concatenate your cluster CA files for "
@@ -599,6 +608,39 @@ def _generate_ca_bundle(
 CA_BUNDLE_PATH: str | None = _config.get("ca_bundle_path")
 if CA_BUNDLE_PATH and CLUSTERS:
     _generate_ca_bundle(CLUSTERS, CA_BUNDLE_PATH)
+
+# --- mTLS readiness summary ---
+_any_cluster_has_ca = any(c.ca_file for c in CLUSTERS) if CLUSTERS else False
+if CLUSTERS and _any_cluster_has_ca:
+    if CA_BUNDLE_PATH:
+        logger.info(
+            "Clusters define ca_file — mTLS will be active when "
+            "Gunicorn uses ca_bundle_path '%s' with CERT_REQUIRED",
+            CA_BUNDLE_PATH,
+        )
+    else:
+        if not INSECURE_MODE:
+            logger.error(
+                "One or more clusters define 'ca_file' but "
+                "'ca_bundle_path' is not configured. Gunicorn needs "
+                "ca_bundle_path to generate the CA bundle for mTLS "
+                "(client certificate verification). Add "
+                "'ca_bundle_path: certs/ca-bundle.pem' to %s",
+                CONFIG_FILE,
+            )
+            sys.exit(1)
+        logger.warning(
+            "Clusters define ca_file but ca_bundle_path is not set. "
+            "mTLS will not be active under Gunicorn. Configure "
+            "ca_bundle_path in %s to enable client certificate "
+            "verification.",
+            CONFIG_FILE,
+        )
+elif CLUSTERS:
+    logger.info(
+        "No cluster defines ca_file — mTLS will not be active "
+        "(no client certificate verification)"
+    )
 
 
 # ===========================================================================
