@@ -1,6 +1,7 @@
 """Tests for CA certificate validation, leaf rejection, and CA bundle generation."""
 
 import os
+from unittest.mock import patch
 
 import pytest
 
@@ -114,8 +115,8 @@ class TestGenerateCaBundle:
         main._generate_ca_bundle([], bundle_path)
         assert not os.path.isfile(bundle_path)
 
-    def test_handles_unwritable_path(self, tmp_path):
-        """Non-writable path should log warning, not crash."""
+    def test_handles_unwritable_path_insecure_mode(self, tmp_path):
+        """Non-writable path in insecure mode should log warning, not crash."""
         ca_cert, _ = generate_ca()
         ca_path = write_pem_cert(ca_cert, tmp_path / "ca.pem")
         clusters = [
@@ -124,9 +125,26 @@ class TestGenerateCaBundle:
                 allowed_networks=[], allowed_subjects=set(),
             ),
         ]
-        # Use a path that cannot be written
-        main._generate_ca_bundle(clusters, "/nonexistent/dir/bundle.pem")
-        # Should not raise — just logs a warning
+        with patch.object(main, "INSECURE_MODE", True):
+            main._generate_ca_bundle(clusters, "/nonexistent/dir/bundle.pem")
+            # Should not raise — just logs a warning
+
+    def test_unwritable_path_exits_in_secure_mode(self, tmp_path):
+        """Non-writable path in secure mode should sys.exit(1)."""
+        ca_cert, _ = generate_ca()
+        ca_path = write_pem_cert(ca_cert, tmp_path / "ca.pem")
+        clusters = [
+            main.ClusterConfig(
+                name="test", ca_file=ca_path,
+                allowed_networks=[], allowed_subjects=set(),
+            ),
+        ]
+        with patch.object(main, "INSECURE_MODE", False):
+            with pytest.raises(SystemExit) as exc_info:
+                main._generate_ca_bundle(
+                    clusters, "/nonexistent/dir/bundle.pem"
+                )
+            assert exc_info.value.code == 1
 
 
 # ===========================================================================

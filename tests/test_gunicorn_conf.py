@@ -594,6 +594,170 @@ class TestPostForkHook:
 
 
 # ===========================================================================
+# mTLS startup enforcement and INFO-level status logging
+# ===========================================================================
+
+def _load_gunicorn_conf_custom(tmp_path, config_text):
+    """Load ``gunicorn.conf.py`` with a caller-supplied ``config.yaml``.
+
+    Returns the module namespace object or raises ``SystemExit`` if the
+    config triggers a startup abort.
+    """
+    saved = os.environ.get("CONFIG_FILE")
+    config_yaml = tmp_path / "config.yaml"
+    config_yaml.write_text(config_text)
+    os.environ["CONFIG_FILE"] = str(config_yaml)
+    try:
+        mod = types.ModuleType("gunicorn_conf_custom")
+        mod.__file__ = str(_CONF_PY)
+        code = _CONF_PY.read_text()
+        exec(compile(code, str(_CONF_PY), "exec"), mod.__dict__)
+    finally:
+        if saved is None:
+            os.environ.pop("CONFIG_FILE", None)
+        else:
+            os.environ["CONFIG_FILE"] = saved
+    return mod
+
+
+class TestMtlsStartupEnforcement:
+    """Verify that gunicorn.conf.py refuses to start in secure mode when
+    mTLS prerequisites are missing, and logs mTLS status at INFO level."""
+
+    def test_missing_ca_bundle_path_with_ca_file_exits(self, tmp_path):
+        """Secure mode + cluster ca_file + no ca_bundle_path → sys.exit(1)."""
+        ca_cert, ca_key = generate_ca(cn="Enforce CA")
+        srv_cert, srv_key = generate_leaf(
+            ca_cert, ca_key, cn="localhost",
+            san_dns=["localhost"], san_ips=["127.0.0.1"],
+        )
+        cert_path = write_pem_cert(srv_cert, tmp_path / "srv.pem")
+        key_path = write_pem_key(srv_key, tmp_path / "srv-key.pem")
+        ca_path = write_pem_cert(ca_cert, tmp_path / "ca.pem")
+
+        config = (
+            f"tls_cert_file: {cert_path}\n"
+            f"tls_key_file: {key_path}\n"
+            "clusters:\n"
+            "  hq:\n"
+            "    allowed_ips:\n"
+            "      - 10.0.0.0/8\n"
+            "    allowed_subjects:\n"
+            "      - cucm.example.com\n"
+            f"    ca_file: {ca_path}\n"
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _load_gunicorn_conf_custom(tmp_path, config)
+        assert exc_info.value.code == 1
+
+    def test_missing_ca_bundle_path_allowed_in_insecure_mode(self, tmp_path):
+        """Insecure mode + cluster ca_file + no ca_bundle_path → no exit."""
+        ca_cert, ca_key = generate_ca(cn="Insecure CA")
+        srv_cert, srv_key = generate_leaf(
+            ca_cert, ca_key, cn="localhost",
+            san_dns=["localhost"], san_ips=["127.0.0.1"],
+        )
+        cert_path = write_pem_cert(srv_cert, tmp_path / "srv.pem")
+        key_path = write_pem_key(srv_key, tmp_path / "srv-key.pem")
+        ca_path = write_pem_cert(ca_cert, tmp_path / "ca.pem")
+
+        config = (
+            "insecure_mode: true\n"
+            f"tls_cert_file: {cert_path}\n"
+            f"tls_key_file: {key_path}\n"
+            "clusters:\n"
+            "  hq:\n"
+            "    allowed_ips:\n"
+            "      - 10.0.0.0/8\n"
+            f"    ca_file: {ca_path}\n"
+        )
+        # Should not raise — insecure mode bypasses the check
+        _load_gunicorn_conf_custom(tmp_path, config)
+
+    def test_bundle_write_failure_exits_in_secure_mode(self, tmp_path):
+        """Secure mode + unwritable ca_bundle_path → sys.exit(1)."""
+        ca_cert, ca_key = generate_ca(cn="Write Fail CA")
+        srv_cert, srv_key = generate_leaf(
+            ca_cert, ca_key, cn="localhost",
+            san_dns=["localhost"], san_ips=["127.0.0.1"],
+        )
+        cert_path = write_pem_cert(srv_cert, tmp_path / "srv.pem")
+        key_path = write_pem_key(srv_key, tmp_path / "srv-key.pem")
+        ca_path = write_pem_cert(ca_cert, tmp_path / "ca.pem")
+
+        config = (
+            f"tls_cert_file: {cert_path}\n"
+            f"tls_key_file: {key_path}\n"
+            "ca_bundle_path: /nonexistent/dir/bundle.pem\n"
+            "clusters:\n"
+            "  hq:\n"
+            "    allowed_ips:\n"
+            "      - 10.0.0.0/8\n"
+            "    allowed_subjects:\n"
+            "      - cucm.example.com\n"
+            f"    ca_file: {ca_path}\n"
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _load_gunicorn_conf_custom(tmp_path, config)
+        assert exc_info.value.code == 1
+
+    def test_mtls_enabled_info_message(self, tmp_path, capsys):
+        """When ca_bundle_path is set and clusters have ca_file, the mTLS
+        ENABLED info message should appear on stderr."""
+        ca_cert, ca_key = generate_ca(cn="mTLS Info CA")
+        srv_cert, srv_key = generate_leaf(
+            ca_cert, ca_key, cn="localhost",
+            san_dns=["localhost"], san_ips=["127.0.0.1"],
+        )
+        cert_path = write_pem_cert(srv_cert, tmp_path / "srv.pem")
+        key_path = write_pem_key(srv_key, tmp_path / "srv-key.pem")
+        ca_path = write_pem_cert(ca_cert, tmp_path / "ca.pem")
+        bundle_path = tmp_path / "ca-bundle.pem"
+
+        config = (
+            f"tls_cert_file: {cert_path}\n"
+            f"tls_key_file: {key_path}\n"
+            f"ca_bundle_path: {bundle_path}\n"
+            "clusters:\n"
+            "  hq:\n"
+            "    allowed_ips:\n"
+            "      - 10.0.0.0/8\n"
+            "    allowed_subjects:\n"
+            "      - cucm.example.com\n"
+            f"    ca_file: {ca_path}\n"
+        )
+        _load_gunicorn_conf_custom(tmp_path, config)
+        captured = capsys.readouterr()
+        assert "mTLS" in captured.err
+        assert "ENABLED" in captured.err
+
+    def test_mtls_not_active_info_message(self, tmp_path, capsys):
+        """When no cluster defines ca_file, the mTLS NOT active info
+        message should appear on stderr."""
+        ca_cert, ca_key = generate_ca(cn="No mTLS CA")
+        srv_cert, srv_key = generate_leaf(
+            ca_cert, ca_key, cn="localhost",
+            san_dns=["localhost"], san_ips=["127.0.0.1"],
+        )
+        cert_path = write_pem_cert(srv_cert, tmp_path / "srv.pem")
+        key_path = write_pem_key(srv_key, tmp_path / "srv-key.pem")
+
+        config = (
+            f"tls_cert_file: {cert_path}\n"
+            f"tls_key_file: {key_path}\n"
+            "clusters:\n"
+            "  hq:\n"
+            "    allowed_ips:\n"
+            "      - 10.0.0.0/8\n"
+            "    allowed_subjects:\n"
+            "      - cucm.example.com\n"
+        )
+        _load_gunicorn_conf_custom(tmp_path, config)
+        captured = capsys.readouterr()
+        assert "mTLS is NOT active" in captured.err
+
+
+# ===========================================================================
 # Subprocess integration test — real Gunicorn process with TLS
 # ===========================================================================
 

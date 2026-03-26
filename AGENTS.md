@@ -82,11 +82,12 @@ The `ca_file` **must** be the root CA certificate (`CA:TRUE`) that anchors the c
 
 ### Secure by default
 
-The service **refuses to start** unless both conditions are met:
+The service **refuses to start** unless all conditions are met:
 1. TLS certificates are configured.
 2. At least one cluster is defined (to restrict access to trusted UCM servers).
+3. If any cluster defines `ca_file`, then `ca_bundle_path` must also be configured (so Gunicorn can generate the CA bundle for mTLS).
 
-Both checks are enforced independently in `main.py` and `gunicorn.conf.py`. Setting `insecure_mode: true` bypasses both requirements (TLS and clusters).
+All checks are enforced independently in `main.py` and `gunicorn.conf.py`. Setting `insecure_mode: true` bypasses all requirements (TLS, clusters, and `ca_bundle_path`).
 
 When `insecure_mode` is enabled:
 - A prominent ASCII warning banner is printed at startup.
@@ -104,7 +105,9 @@ Hashes use HMAC-SHA256 with a per-startup random salt (32 bytes from `secrets.to
 
 ### CA bundle auto-generation
 
-When `ca_bundle_path` is set in config, the app concatenates all unique cluster `ca_file` entries into a single PEM bundle at startup. This file is what Gunicorn's `--ca-certs` should point to.
+When `ca_bundle_path` is set in config, the app concatenates all unique cluster `ca_file` entries into a single PEM bundle at startup. This file is what Gunicorn's `--ca-certs` should point to. In secure mode, `ca_bundle_path` is **required** when any cluster defines `ca_file` — without it, Gunicorn cannot enable `CERT_REQUIRED` and mTLS would be silently inactive. Both `main.py` and `gunicorn.conf.py` enforce this and exit with a clear error if the requirement is not met. If bundle generation fails (e.g. unwritable path), the service also refuses to start in secure mode.
+
+At startup, both `gunicorn.conf.py` and `main.py` log the mTLS status at INFO level so operators can immediately confirm whether client certificate verification is active.
 
 ### Phone number matching
 
